@@ -28,7 +28,7 @@
 
 ## 3. 缓存目录
 
-- [ ] 3.1 `FileUtils.cleanPlayerCache()` 拆出包内重载 `cleanPlayerCache(String cachePath, String externalCachePath)`，增加删除 `<外部缓存目录>/` + `HlsPrecache.CACHE_DIR_NAME`（D9），先写 `FileUtilsCleanPlayerCacheTest` 再改；`App.onCreate()` 紧跟 `FileUtils.cleanPlayerCache()` 之后调用 `HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPrecache.CACHE_DIR_NAME))`。依赖 S1 的接口骨架
+- [x] 3.1 `FileUtils.cleanPlayerCache()` 拆出包内重载 `cleanPlayerCache(String cachePath, String externalCachePath)`，增加删除 `<外部缓存目录>/` + `HlsPrecache.CACHE_DIR_NAME`（D9），先写 `FileUtilsCleanPlayerCacheTest` 再改；`App.onCreate()` 紧跟 `FileUtils.cleanPlayerCache()` 之后调用 `HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPrecache.CACHE_DIR_NAME))`。依赖 S1 的接口骨架
   - writes: app/src/main/java/com/github/tvbox/osc/util/FileUtils.java, app/src/test/java/com/github/tvbox/osc/util/FileUtilsCleanPlayerCacheTest.java, app/src/main/java/com/github/tvbox/osc/base/App.java
   - reads: openspec/changes/add-hls-precache-playback/design.md, openspec/changes/add-hls-precache-core/design.md
   - depends-on: 无（需要 S1 的接口骨架已经提交到 change 分支）
