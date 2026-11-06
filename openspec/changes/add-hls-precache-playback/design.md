@@ -150,6 +150,7 @@ private void playUrl(String url, HashMap<String, String> headers, boolean precac
         startPlayUrl(url, headers);
         return;
     }
+    m3u8Closed = false;                   // 发起新的拉取前复位（D6）
     // cancelTag、HttpHeaders 组装、两层 OkGo 请求结构、onError 回退保持不变
     //   第一层 onSuccess：
     //     if (!M3u8PlayPlanner.isPlaylist(content)) { startPlayUrl(url, headers); return; }
@@ -167,7 +168,8 @@ private void cancelM3u8Fetch() {          // 只在 playUrl 开头调用，和 m
 /** 离开播放页之后才到达的回调直接丢弃，不调用 rewrite（见 D6）。 */
 private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
                       boolean purify, boolean precache) {
-    if (!isAdded()) return;               // PlayActivity：if (isFinishing() || isDestroyed()) return;
+    if (!isAdded() || m3u8Closed || requireActivity().isFinishing()) return;
+                                          // PlayActivity：if (isFinishing() || isDestroyed() || m3u8Closed) return;
     M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
             RemoteServer.serverPort, M3U8::purify,
             (u, c, h, port) -> HlsPrecache.get().rewrite(u, c, h, port, owner));   // owner = precacheOwner 的局部副本（D6）
@@ -258,8 +260,8 @@ private void startPlayUrl(String url, HashMap<String, String> headers, boolean k
 **晚到的 m3u8 回调**：OkGo 回调在主线程派发，离开播放页时可能已经在队列里。只结束会话不够，回调之后还会 `rewrite` 出一个没人用的新会话。做法：
 
 - 每个页面有一个 `volatile boolean m3u8Closed`：`PlayFragment.onDestroyView`、`PlayActivity.onDestroy` 和 `PlayActivity` 关闭画中画小窗的分支在 `endSession(owner)` 之前把它设为 true；`playUrl` 发起 m3u8 拉取前把它复位为 false。
-- `playM3u8` 在调用 `plan()` 之前检查页面还在不在（PlayFragment 用 `!isAdded() || m3u8Closed`，PlayActivity 用 `isFinishing() || isDestroyed() || m3u8Closed`），不在就直接返回，不调用 `rewrite`，也不写 `RemoteServer.m3u8Content`。
-- **离开播放页时不 `cancelTag`**（第 1 轮返工曾这样做，复查发现回归后撤回）：`m3u8-1` / `m3u8-2` 是进程内全局字符串，旧页面晚到的销毁会把新页面正在进行的 m3u8 拉取取消掉；OkGo 3.0.4 对已取消的请求既不回调 `onSuccess` 也不回调 `onError`，新页面会卡在加载，而且和预缓存开关无关。所以 `cancelM3u8Fetch()` 只保留在 `playUrl` 开头，和 main 一致。拉取失败、内容不是 m3u8 的回退走 `startPlayUrl`，它本来就只结束会话、不建会话，页面不在时由它自己的检查返回（PlayFragment 是 `isAdded()`，PlayActivity 是 `mVideoView == null`）。
+- `playM3u8` 在调用 `plan()` 之前检查页面还在不在（PlayFragment 用 `!isAdded() || m3u8Closed || requireActivity().isFinishing()`，最后一项挡住「旧 DetailActivity 已 finish、还没执行 onDestroyView」时晚到的回调；PlayActivity 用 `isFinishing() || isDestroyed() || m3u8Closed`），不在就直接返回，不调用 `rewrite`，也不写 `RemoteServer.m3u8Content`。
+- **离开播放页时不 `cancelTag`**（第 1 轮返工曾这样做，复查发现回归后撤回）：`m3u8-1` / `m3u8-2` 是进程内全局字符串，旧页面晚到的销毁会把新页面正在进行的 m3u8 拉取取消掉；OkGo 3.0.4 对已取消的请求既不回调 `onSuccess` 也不回调 `onError`，新页面会卡在加载，而且和预缓存开关无关。所以 `cancelM3u8Fetch()` 只保留在 `playUrl` 开头，和 main 一致。拉取失败、内容不是 m3u8 的回退走 `startPlayUrl`，它只结束本页的会话、从不建会话，所以不受 `m3u8Closed` 约束也不影响会话正确性；页面不在时由它自己的检查返回（PlayFragment 是 `isAdded()`，PlayActivity 是 `mVideoView == null`）。例外：PlayActivity 关闭画中画但还没销毁时 `mVideoView` 只 release 未置空，回退路径仍会重新起播，这和 main 一致。
 
 **只结束本页的会话**：`BaseActivity` 后台设置为画中画时（`BaseActivity.java:254-260`）和推送 `receiver/DetailReceiver.java:24-28` 都是先 finish 旧的 DetailActivity、再启动新的。旧页面的 `onDestroyView` / `onDestroy` 可能在新页面已经 `rewrite` 之后才执行；无条件的 `endSession()` 会把新页面的会话结束掉，新播放器之后请求分片拿到 410。所以：
 
@@ -435,6 +437,9 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
     7. **302 重定向、相对分片的 m3u8**：在电脑上起一个会把 `/a/index.m3u8` 302 到 `/b/index.m3u8` 的服务（比如 nginx `return 302`，或者几行 Python `http.server`），`/b/index.m3u8` 是带 ENDLIST 的媒体列表，分片写成相对地址 `seg0.ts`、`seg1.ts`……放在 `/b/` 下，`/a/` 下没有分片。分别在「广告过滤」开启和关闭、「预缓存」开启时播放 `/a/index.m3u8`：都能正常起播和拖动；看本地列表，分片指向 `/hlsseg`；电脑端访问日志里分片请求的路径都是 `/b/seg*.ts`，没有 `/a/seg*.ts`。再关掉预缓存播放同一地址：和改动前一样能播放（广告过滤开启时行为与 main 一致）。
 
 ## Risks / Trade-offs
+
+- **[已接受的行为差异] 开关关闭时 PlayActivity 晚到的 playlist 回调被丢弃**：Activity 正在 finishing、或画中画小窗已关闭（`m3u8Closed`）时，晚到的 m3u8 回调在 `playM3u8` 里直接返回；main 会写 `m3u8Content` 并在 `startPlayUrl` 里重新起播。这是改进（关掉小窗后不会再在后台出声），但它和 main 不完全一致。拉取失败或内容不是 m3u8 的回退路径不受这个标记约束，行为和 main 相同。PlayFragment 只有「不写 `m3u8Content`」这一处差异。
+- **[已知，不处理] 画中画关闭后进行中的解析仍可能重新起播**：关闭画中画的分支不调用 `stopParse()`，关闭时还在进行的解析或嗅探之后会调用 `playUrl`，复位 `m3u8Closed` 并在已关闭的小窗里重新起播、建本页的会话，直到 onDestroy 或下一次 rewrite 才结束。main 在这里同样会重新起播，不是预缓存引入的。
 
 - **[风险] 两个播放页同时存在时争用唯一的会话。** 比如详情页 A 的小窗暂停后又打开了另一个播放页 B：B 开始播放会替换 A 的会话，B 关闭时结束会话。回到 A 继续播放，播放器请求旧会话的分片拿到 410，按「出错自动重试」切内核后重新改写，表现为一次短暂的重新加载。→ 这是 S1「同一时间只有一个会话」的直接后果，场景少见，第一期接受，写入 Non-goals；手动验证第 8 项会观察切换时的表现。
 - **[风险] 开关打开、去广告关闭时，起播多一次 m3u8 请求。** → 和去广告开启时现有的开销相同；失败回退原地址。

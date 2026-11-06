@@ -771,7 +771,8 @@ public class PlayFragment extends BaseLazyFragment {
     /** 拿到 m3u8 之后决定交给播放器什么并开始播放。离开详情页之后（Fragment 已经 detach）才到达的回调直接丢弃，不调用 rewrite，不留下没人用的预缓存会话。 */
     private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
                           boolean purify, boolean precache) {
-        if (!isAdded() || m3u8Closed) return;
+        // isFinishing：旧 DetailActivity 已 finish、还没执行 onDestroyView 时晚到的回调也丢弃，免得替换新页面的会话
+        if (!isAdded() || m3u8Closed || requireActivity().isFinishing()) return;
         final Object owner = precacheOwner;   // lambda 只捕获 owner，不捕获页面
         M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
                 RemoteServer.serverPort, M3U8::purify,
