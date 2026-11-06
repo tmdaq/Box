@@ -125,6 +125,23 @@ public final class HlsPrecache {
     }
 
     /**
+     * 同 {@link #rewrite(String, String, Map, int)}，并把新会话记在 owner 名下，供 {@link #endSession(Object)} 识别。
+     * owner 由播放页自己 new 一个普通 Object 传入，不能传 Context。
+     * 当前是接口骨架：忽略 owner，实现由返工任务补全。
+     */
+    public String rewrite(String playlistUrl, String content, Map<String, String> headers, int port, Object owner) {
+        return rewrite(playlistUrl, content, headers, port);
+    }
+
+    /**
+     * 只在当前会话属于 owner 时结束它；不属于时什么都不做。线程与异常语义同 {@link #endSession()}。
+     * 当前是接口骨架：忽略 owner、无条件结束，实现由返工任务补全。
+     */
+    public void endSession(Object owner) {
+        endSession();
+    }
+
+    /**
      * 分片代理的入口，由 S2 在 NanoHTTPD 的请求线程上调用。
      *
      * @param sessionId session.getParms().get(PARAM_SESSION)，可以为 null
