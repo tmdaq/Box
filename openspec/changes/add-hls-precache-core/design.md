@@ -580,6 +580,11 @@ rewrite(url, content, headers, port):
 
 endSession(): old = current; current = null; if (old != null) { old.close(); ioExecutor.execute(old.store()::deleteAll); }
 
+rewrite(url, content, headers, port, owner): 同 4 参版，新会话建好时在门面锁里记下 currentOwner = owner；4 参版即 owner = null。
+                                            不适用或抛异常时同 4 参版：无条件结束上一个会话，返回 null。
+endSession(owner): owner == null → 什么都不做；持门面锁比较 currentOwner == owner（同一个对象），
+                   不相等什么都不做，相等时和 endSession() 一样结束。current 被摘下时 currentOwner 一起清空。
+
 openSegment(sid, idx): 校验参数（400）→ s = current（volatile 读，不持门面锁）→ s == null 或 !s.id().equals(sid) → 410
                        → idx >= s.segmentCount() → 404 → s.open(idx)；捕获 Throwable → 500
 ```

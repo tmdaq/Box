@@ -201,6 +201,70 @@ public class HlsPrecacheTest {
         assertEquals(0, origin.totalRequests());
     }
 
+    // ---- 按 owner 结束会话 ----
+
+    /** 会话还有效时，越界的序号是 404；会话已结束是 410。都不请求源站。 */
+    private boolean isLive(String id) {
+        int status = precache.openSegment(id, "3").status;
+        assertTrue(String.valueOf(status), status == 404 || status == 410);
+        return status == 404;
+    }
+
+    @Test
+    public void endSessionOfAnEarlierOwnerDoesNotEndTheNewerOwnersSession() {
+        Object pageA = new Object();
+        Object pageB = new Object();
+        precache.rewrite(URL_A, M3U8, null, 9978, pageA);
+        String b = sessionId(precache.rewrite(URL_B, M3U8, null, 9978, pageB));
+
+        // 旧页面的 onDestroy 晚于新页面的 rewrite 到达
+        precache.endSession(pageA);
+        assertTrue("B's session survives A's endSession", isLive(b));
+
+        precache.endSession(pageB);
+        assertFalse("B ends its own session", isLive(b));
+        assertEquals(0, origin.totalRequests());
+    }
+
+    @Test
+    public void endSessionWithNullOwnerDoesNothing() {
+        String owned = sessionId(precache.rewrite(URL_A, M3U8, null, 9978, new Object()));
+        precache.endSession(null);
+        assertTrue(isLive(owned));
+
+        String unowned = sessionId(rewrite(URL_B));
+        precache.endSession(null);
+        assertTrue("a session without owner is not ended by endSession(null)", isLive(unowned));
+    }
+
+    @Test
+    public void endSessionWithAnOwnerDoesNotEndASessionWithoutOwner() {
+        String unowned = sessionId(rewrite(URL_A));
+
+        precache.endSession(new Object());
+
+        assertTrue(isLive(unowned));
+    }
+
+    @Test
+    public void endSessionWithoutOwnerStillEndsAnOwnedSession() {
+        String owned = sessionId(precache.rewrite(URL_A, M3U8, null, 9978, new Object()));
+
+        precache.endSession();
+
+        assertFalse(isLive(owned));
+    }
+
+    @Test
+    public void notApplicableRewriteWithOwnerEndsThePreviousSession() {
+        Object page = new Object();
+        String id = sessionId(precache.rewrite(URL_A, M3U8, null, 9978, page));
+
+        assertNull(precache.rewrite(URL_A, "#EXTM3U\n#EXTINF:10,\nseg0.ts\n", null, 9978, new Object()));
+
+        assertFalse(isLive(id));
+    }
+
     // ---- 会话复用与清空 ----
 
     @Test

@@ -54,6 +54,8 @@ public final class HlsPrecache {
     private volatile File cacheRoot;
     /** 写入时持有本对象的锁；openSegment 不持锁读取。 */
     private volatile PrecacheSession current;
+    /** 当前会话是谁建的（4 参的 rewrite 建的为 null）。和 current 一起、只在本对象的锁里读写。 */
+    private Object currentOwner;
 
     HlsPrecache(PrecacheConfig config, SegmentDownloader downloader, Executor downloadExecutor, Executor ioExecutor) {
         this.config = config;
@@ -96,12 +98,7 @@ public final class HlsPrecache {
      * 异常：不抛异常。内部出现任何 Throwable 都当作不适用，返回 null。
      */
     public String rewrite(String playlistUrl, String content, Map<String, String> headers, int port) {
-        try {
-            return switchSession(HlsPlaylist.parse(playlistUrl, content), playlistUrl, copy(headers), port);
-        } catch (Throwable t) {
-            endSession();
-            return null;
-        }
+        return rewrite(playlistUrl, content, headers, port, null);
     }
 
     /**
@@ -112,13 +109,9 @@ public final class HlsPrecache {
         try {
             PrecacheSession old;
             synchronized (this) {
-                old = current;
-                current = null;
+                old = detachCurrent();
             }
-            if (old != null) {
-                old.close();
-                deleteInBackground(old.store());
-            }
+            end(old);
         } catch (Throwable ignored) {
             // 约定不抛异常
         }
@@ -126,19 +119,34 @@ public final class HlsPrecache {
 
     /**
      * 同 {@link #rewrite(String, String, Map, int)}，并把新会话记在 owner 名下，供 {@link #endSession(Object)} 识别。
-     * owner 由播放页自己 new 一个普通 Object 传入，不能传 Context。
-     * 当前是接口骨架：忽略 owner，实现由返工任务补全。
+     * owner 由播放页自己 new 一个普通 Object 传入，不能传 Context（单例会持有它，直到会话被替换或结束）。
+     * 不适用或内部出错时，和 4 参版一样：结束上一个会话（不管它属于谁），返回 null。
      */
     public String rewrite(String playlistUrl, String content, Map<String, String> headers, int port, Object owner) {
-        return rewrite(playlistUrl, content, headers, port);
+        try {
+            return switchSession(HlsPlaylist.parse(playlistUrl, content), playlistUrl, copy(headers), port, owner);
+        } catch (Throwable t) {
+            endSession();
+            return null;
+        }
     }
 
     /**
-     * 只在当前会话属于 owner 时结束它；不属于时什么都不做。线程与异常语义同 {@link #endSession()}。
-     * 当前是接口骨架：忽略 owner、无条件结束，实现由返工任务补全。
+     * 只在当前会话的 owner 和传入的 owner 是同一个对象（==）时结束它，否则什么都不做；owner 为 null 时什么都不做。
+     * 线程与异常语义同 {@link #endSession()}。
      */
     public void endSession(Object owner) {
-        endSession();
+        if (owner == null) return;
+        try {
+            PrecacheSession old;
+            synchronized (this) {
+                if (currentOwner != owner) return;
+                old = detachCurrent();
+            }
+            end(old);
+        } catch (Throwable ignored) {
+            // 约定不抛异常
+        }
     }
 
     /**
@@ -168,11 +176,25 @@ public final class HlsPrecache {
 
     // ---- 内部 ----
 
-    /** 结束上一个会话；适用时开始新会话并返回改写结果（D13）。 */
-    private synchronized String switchSession(HlsPlaylist playlist, String playlistUrl,
-                                              Map<String, String> headers, int port) {
+    /** 摘下当前会话（和它的 owner），返回它，可能为 null。在本对象的锁里调用。 */
+    private PrecacheSession detachCurrent() {
         PrecacheSession old = current;
         current = null;
+        currentOwner = null;
+        return old;
+    }
+
+    /** 结束已经摘下的会话：取消下载、后台删目录。不持本对象的锁调用。 */
+    private void end(PrecacheSession old) {
+        if (old == null) return;
+        old.close();
+        deleteInBackground(old.store());
+    }
+
+    /** 结束上一个会话；适用时开始新会话、记下 owner，并返回改写结果（D13）。 */
+    private synchronized String switchSession(HlsPlaylist playlist, String playlistUrl,
+                                              Map<String, String> headers, int port, Object owner) {
+        PrecacheSession old = detachCurrent();
         if (old != null) old.close();
         File root = cacheRoot;
         boolean reuse = playlist != null && root != null && old != null && old.store().playlistUrl().equals(playlistUrl);
@@ -182,6 +204,7 @@ public final class HlsPrecache {
         SegmentStore store = reuse ? old.store() : new SegmentStore(new File(root, "s" + id), playlistUrl);
         String rendered = playlist.render(segmentUrlPrefix(port, id));
         current = new PrecacheSession(id, playlist, headers, store, config, downloader, downloadExecutor);
+        currentOwner = owner;
         return rendered;
     }
 
