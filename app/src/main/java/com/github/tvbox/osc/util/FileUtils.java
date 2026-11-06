@@ -6,6 +6,7 @@ import android.util.Base64;
 
 import com.github.catvod.utils.Path;
 import com.github.tvbox.osc.base.App;
+import com.github.tvbox.osc.precache.HlsPrecache;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.util.StringUtils;
 import com.github.tvbox.osc.util.urlhttp.OkHttpUtil;
@@ -319,9 +320,15 @@ public class FileUtils {
     }
 
     public static void cleanPlayerCache() {
-        recursiveDelete(new File(getCachePath() + File.separator + "thunder"));
-        recursiveDelete(new File(getExternalCachePath() + File.separator + "ijkcaches"));
-        recursiveDelete(new File(getExternalCachePath() + File.separator + "jpali" + File.separator + "Downloads"));
+        cleanPlayerCache(getCachePath(), getExternalCachePath());
+    }
+
+    /** 包内可见，供测试传入临时目录。 */
+    static void cleanPlayerCache(String cachePath, String externalCachePath) {
+        recursiveDelete(new File(cachePath + File.separator + "thunder"));
+        recursiveDelete(new File(externalCachePath + File.separator + "ijkcaches"));
+        recursiveDelete(new File(externalCachePath + File.separator + "jpali" + File.separator + "Downloads"));
+        recursiveDelete(new File(externalCachePath + File.separator + HlsPrecache.CACHE_DIR_NAME));
     }
 
     public static String getFileName(String filePath) {

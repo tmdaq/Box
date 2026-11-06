@@ -13,6 +13,7 @@ import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.callback.EmptyCallback;
 import com.github.tvbox.osc.callback.LoadingCallback;
 import com.github.tvbox.osc.data.AppDataManager;
+import com.github.tvbox.osc.precache.HlsPrecache;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.util.EpgUtil;
 import com.github.tvbox.osc.util.FileUtils;
@@ -99,6 +100,7 @@ public class App extends MultiDexApplication {
         FileUtils.recursiveDelete(dir);*/
 
         FileUtils.cleanPlayerCache();
+        HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPrecache.CACHE_DIR_NAME));
 
         // Add JS support
         QuickJSLoader.init();
