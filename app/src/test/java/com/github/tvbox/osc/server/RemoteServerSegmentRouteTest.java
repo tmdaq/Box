@@ -13,6 +13,8 @@ import android.app.Application;
 
 import androidx.test.core.app.ApplicationProvider;
 
+import com.github.tvbox.osc.R;
+
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -127,9 +129,10 @@ public class RemoteServerSegmentRouteTest {
     }
 
     @Test
-    public void postDoesNotReachTheSeam() {
-        server.serve(segmentSession(Method.POST, "127.0.0.1", params("abc", "3")));
+    public void postFallsBackToDefaultPageWithoutReachingTheSeam() throws IOException {
+        Response response = server.serve(segmentSession(Method.POST, "127.0.0.1", params("abc", "3")));
 
+        assertDefaultPage(response);
         assertTrue(server.calls.isEmpty());
     }
 
@@ -238,6 +241,15 @@ public class RemoteServerSegmentRouteTest {
     private RawHttpClient.Response getSegment() throws IOException {
         server.start();
         return RawHttpClient.get(server.getListeningPort(), SEGMENT_URL, ACCEPT_GZIP);
+    }
+
+    /** 同 RemoteServerRoutesTest：默认页是 R.raw.index 的原始字节。 */
+    private static void assertDefaultPage(Response response) throws IOException {
+        assertEquals(Response.Status.OK, response.getStatus());
+        assertEquals(NanoHTTPD.MIME_HTML + "; charset=utf-8", response.getMimeType());
+        try (InputStream index = ApplicationProvider.getApplicationContext().getResources().openRawResource(R.raw.index)) {
+            assertArrayEquals(readAll(index), readAll(response.getData()));
+        }
     }
 
     private static Map<String, String> params(String session, String index) {
