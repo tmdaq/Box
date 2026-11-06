@@ -237,6 +237,11 @@ final class SegmentDownload implements Runnable {
         return state != State.PENDING && state != State.STREAMING;
     }
 
+    /** 还在下载，或者已经提交：新来的读者可以等它或者直接读它，不需要再下载一次。 */
+    synchronized boolean canServe() {
+        return !isFinished() || state == State.COMPLETED;
+    }
+
     /** 任意线程，不阻塞。取消后不会提交，读者抛 IOException。 */
     void cancel() {
         SegmentDownloader.Call c;

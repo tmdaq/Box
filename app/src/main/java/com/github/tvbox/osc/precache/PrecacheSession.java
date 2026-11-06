@@ -130,7 +130,7 @@ final class PrecacheSession implements SegmentDownload.Listener {
         if (hit != null) return new Lookup(hit, null);
         if (degraded) return FORWARD;
         SegmentDownload d = downloads.get(seg.index);
-        if (d == null || d.isFinished()) {
+        if (d == null || !d.canServe()) {
             prefetchFailed.remove(seg.index);
             d = start(seg, false);
         }

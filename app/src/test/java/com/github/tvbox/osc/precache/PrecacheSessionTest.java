@@ -239,6 +239,41 @@ public class PrecacheSessionTest {
     }
 
     @Test
+    public void prefetchCompletingWhileThePlayerLooksItUpIsServedWithoutASecondRequest() throws Exception {
+        CountDownLatch gate = gate();
+        origin.on(url(1)).body(bytes(1)).holdBody(10, gate);
+        AtomicInteger lookups = new AtomicInteger();
+        // 播放器查磁盘时还没提交；查完、找到正在进行的下载之前，这个预缓存下载完成并提交
+        store = new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            File committedFile(String key) {
+                File file = super.committedFile(key);
+                if (key.equals(key(1)) && lookups.getAndIncrement() == 0) {
+                    gate.countDown();
+                    awaitQuietly(() -> isCommitted(key(1)));
+                }
+                return file;
+            }
+        };
+        newSession(5);
+        play(0);
+        eventually("seg1 prefetch started", () -> origin.requestCount(url(1)) == 1);
+
+        assertArrayEquals(bytes(1), play(1));
+
+        assertEquals("served from the prefetch, not a new download", 1, origin.requestCount(url(1)));
+    }
+
+    /** 在钩子里等条件成立；超时由调用它的测试的断言暴露。 */
+    private static void awaitQuietly(Condition condition) {
+        try {
+            eventually("hook condition", condition);
+        } catch (InterruptedException | AssertionError ignored) {
+            // 钩子不抛异常
+        }
+    }
+
+    @Test
     public void externallyDeletedFileIsDownloadedAgain() throws Exception {
         newSession(5);
         play(0);
