@@ -6,22 +6,22 @@
 
 所有路径都相对仓库根目录。`<main>` = `app/src/main/java/com/github/tvbox/osc/precache`，`<test>` = `app/src/test/java/com/github/tvbox/osc/precache`。每个任务都先写失败的测试，再写实现（TDD）。
 
-- [ ] 1.1 m3u8 解析与改写：`HlsSegment`、`HlsPlaylist`（D2）。表驱动测试覆盖：分片一对一替换、`\r\n` 和空行、残留的 DISCONTINUITY、MEDIA-SEQUENCE 不变、相对和绝对分片地址、多个 KEY、MAP、`METHOD=NONE`、EXTINF 缺失时的时长回退、`key` 是绝对地址的 SHA-1，以及 D2 列出的每一种不适用情况
+- [x] 1.1 m3u8 解析与改写：`HlsSegment`、`HlsPlaylist`（D2）。表驱动测试覆盖：分片一对一替换、`\r\n` 和空行、残留的 DISCONTINUITY、MEDIA-SEQUENCE 不变、相对和绝对分片地址、多个 KEY、MAP、`METHOD=NONE`、EXTINF 缺失时的时长回退、`key` 是绝对地址的 SHA-1，以及 D2 列出的每一种不适用情况
   - writes: app/src/main/java/com/github/tvbox/osc/precache/HlsSegment.java, app/src/main/java/com/github/tvbox/osc/precache/HlsPlaylist.java, app/src/test/java/com/github/tvbox/osc/precache/HlsPlaylistTest.java
   - reads: openspec/changes/add-hls-precache-core/design.md, openspec/changes/add-hls-precache-core/specs/vod-player/spec.md, app/src/main/java/com/github/tvbox/osc/util/M3U8.java, app/src/test/java/com/github/tvbox/osc/util/M3U8PurifyTest.java
   - depends-on: 无
   - verify: com.github.tvbox.osc.precache.HlsPlaylistTest
-- [ ] 1.2 窗口计算：`PrecacheWindow`（D9）。测试覆盖：每片 10 秒、锚点 10 时窗口是 10..21、回看是 7..9；列表末尾截断；长度不一的分片；锚点为 0；`isJump` 的各种情况
+- [x] 1.2 窗口计算：`PrecacheWindow`（D9）。测试覆盖：每片 10 秒、锚点 10 时窗口是 10..21、回看是 7..9；列表末尾截断；长度不一的分片；锚点为 0；`isJump` 的各种情况
   - writes: app/src/main/java/com/github/tvbox/osc/precache/PrecacheWindow.java, app/src/test/java/com/github/tvbox/osc/precache/PrecacheWindowTest.java
   - reads: openspec/changes/add-hls-precache-core/design.md
   - depends-on: 无
   - verify: com.github.tvbox.osc.precache.PrecacheWindowTest
-- [ ] 1.3 回源接口、OkHttp 实现和测试替身：`SegmentDownloader`（含 `Call`、`Source`）、`OkHttpSegmentDownloader`（D4）、`FakeSegmentDownloader`。用 MockWebServer 测试：请求头 trim、丢弃的头、2xx 和非 2xx、Content-Length 已知和未知、gzip 透明解压、`cancel()` 让执行或读取失败、连接被拒抛 `ConnectException`
+- [x] 1.3 回源接口、OkHttp 实现和测试替身：`SegmentDownloader`（含 `Call`、`Source`）、`OkHttpSegmentDownloader`（D4）、`FakeSegmentDownloader`。用 MockWebServer 测试：请求头 trim、丢弃的头、2xx 和非 2xx、Content-Length 已知和未知、gzip 透明解压、`cancel()` 让执行或读取失败、连接被拒抛 `ConnectException`
   - writes: app/src/main/java/com/github/tvbox/osc/precache/SegmentDownloader.java, app/src/main/java/com/github/tvbox/osc/precache/OkHttpSegmentDownloader.java, app/src/test/java/com/github/tvbox/osc/precache/OkHttpSegmentDownloaderTest.java, app/src/test/java/com/github/tvbox/osc/precache/FakeSegmentDownloader.java
   - reads: openspec/changes/add-hls-precache-core/design.md, app/src/main/java/com/github/tvbox/osc/util/OkGoHelper.java, app/build.gradle
   - depends-on: 无（需要前置的 build.gradle 改动已经提交）
   - verify: com.github.tvbox.osc.precache.OkHttpSegmentDownloaderTest
-- [ ] 1.4 磁盘存储与单个分片的下载：`SegmentStore`（D6）、`SegmentDownload`（D7）。用 `TemporaryFolder` 测试：
+- [x] 1.4 磁盘存储与单个分片的下载：`SegmentStore`（D6）、`SegmentDownload`（D7）。用 `TemporaryFolder` 测试：
   - commit 后能读到，`committedBytes`、`averageSize` 正确
   - 文件被外部删除后按未命中处理；目录被删后会 mkdirs 重建；`deleteAll`
   - 多个读者跟读拿到的字节和源站一致，源站只被请求 1 次
@@ -32,7 +32,7 @@
   - reads: openspec/changes/add-hls-precache-core/design.md, app/src/main/java/com/github/tvbox/osc/precache/SegmentDownloader.java, app/src/main/java/com/github/tvbox/osc/precache/HlsSegment.java, app/src/test/java/com/github/tvbox/osc/precache/FakeSegmentDownloader.java
   - depends-on: 1.1, 1.3
   - verify: com.github.tvbox.osc.precache.SegmentStoreTest, com.github.tvbox.osc.precache.SegmentDownloadTest
-- [ ] 1.5 会话与调度：`PrecacheConfig`、`SegmentResponse`、`PrecacheSession`（D8、D9、D10、D11、D12）。按 spec 场景逐条测试：
+- [x] 1.5 会话与调度：`PrecacheConfig`、`SegmentResponse`、`PrecacheSession`（D8、D9、D10、D11、D12）。按 spec 场景逐条测试：
   - 命中、未命中边下边返回、同一分片的并发请求只回源 1 次
   - 源站错误码原样返回、无法连接返回 502
   - 磁盘失败后降级为纯转发
@@ -44,7 +44,7 @@
   - reads: openspec/changes/add-hls-precache-core/design.md, openspec/changes/add-hls-precache-core/specs/vod-player/spec.md, app/src/main/java/com/github/tvbox/osc/precache/HlsPlaylist.java, app/src/main/java/com/github/tvbox/osc/precache/PrecacheWindow.java, app/src/main/java/com/github/tvbox/osc/precache/SegmentStore.java, app/src/main/java/com/github/tvbox/osc/precache/SegmentDownload.java
   - depends-on: 1.1, 1.2, 1.4
   - verify: com.github.tvbox.osc.precache.PrecacheSessionTest
-- [ ] 1.6 门面：`HlsPrecache`（D3、D5、D13，以及 design.md「跨 change 接口」一节的签名，必须逐字一致）。测试覆盖：
+- [x] 1.6 门面：`HlsPrecache`（D3、D5、D13，以及 design.md「跨 change 接口」一节的签名，必须逐字一致）。测试覆盖：
   - 400/404/410
   - 代理地址的格式 `http://127.0.0.1:<port>/hlsseg?s=<id>&i=<n>`，每次 rewrite 都换新的 id
   - 同一 playlistUrl 复用分片并且不删目录；不同 playlistUrl 或调用 `endSession` 时删除旧目录
