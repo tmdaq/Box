@@ -1272,6 +1272,7 @@ public class PlayActivity extends BaseActivity {
             // Closed playback
             if (onStopCalled) {
                 mVideoView.release();
+                cancelM3u8Fetch();
                 HlsPrecache.get().endSession(precacheOwner);
             }
             unregisterReceiver(pipActionReceiver);

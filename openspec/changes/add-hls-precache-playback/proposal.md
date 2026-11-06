@@ -45,6 +45,6 @@ Issue: #4
   - 修改 `ui/fragment/PlayFragment.java`、`ui/activity/PlayActivity.java`：`playUrl`、`startPlayUrl`、特殊链接的调用点、`onDestroyView` / `onDestroy`，以及 PlayActivity 画中画窗口关闭的分支。
   - 修改 `util/HawkConfig.java`、`ui/fragment/ModelSettingFragment.java`、`util/FileUtils.java`、`base/App.java`。
   - 修改资源：`res/layout/fragment_model.xml`、`res/layout-v21/fragment_model.xml`、`res/values/strings.xml`、`res/values-zh/strings.xml`。
-- **依赖**：编译依赖 S1 的 `com.github.tvbox.osc.precache.HlsPrecache`（只用 `CACHE_DIR_NAME`、`get()`、`setCacheRoot`、`rewrite`、`endSession`）。S1 的接口骨架会先提交到 change 分支上。运行时没有新的第三方依赖。
+- **依赖**：编译依赖 S1 的 `com.github.tvbox.osc.precache.HlsPrecache`（只用 `CACHE_DIR_NAME`、`get()`、`setCacheRoot`，以及 dev-test 返工时新增的带 owner 的 `rewrite(..., Object owner)` / `endSession(Object owner)`，播放页只结束自己建的会话）。S1 的接口骨架会先提交到 change 分支上。运行时没有新的第三方依赖。
 - **配置与数据**：新增 Hawk 键 `hls_precache`（默认 false）；新增磁盘目录 `<外部缓存目录>/hlscache/`，每次 App 启动时清空。
 - **owner-only 文件**：不需要改 `AndroidManifest.xml` 和任何 gradle 文件。
