@@ -85,13 +85,25 @@ public class RemoteServerSegmentRouteTest {
 
     @Test
     public void nonLoopbackRequestsGet403WithoutReachingTheSeam() throws IOException {
-        for (String ip : Arrays.asList("192.168.1.20", "10.0.0.2", "", null)) {
+        for (String ip : Arrays.asList("192.168.1.20", "10.0.0.2", "127.0.0.2", "", null)) {
             Response response = server.serve(segmentSession(Method.GET, ip, params("abc", "3")));
 
             assertEquals(ip, 403, response.getStatus().getRequestStatus());
             assertEquals(ip, NanoHTTPD.MIME_PLAINTEXT, response.getMimeType());
             assertEquals(ip, 0, readAll(response.getData()).length);
         }
+        assertTrue(server.calls.isEmpty());
+    }
+
+    @Test
+    public void forgedLoopbackHeadersFromLanStillGet403WithoutReachingTheSeam() {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("x-forwarded-for", "127.0.0.1");
+        headers.put("remote-addr", "127.0.0.1");
+
+        Response response = server.serve(segmentSession(Method.GET, "192.168.1.20", params("abc", "3"), headers));
+
+        assertEquals(403, response.getStatus().getRequestStatus());
         assertTrue(server.calls.isEmpty());
     }
 
@@ -236,11 +248,17 @@ public class RemoteServerSegmentRouteTest {
     }
 
     private static IHTTPSession segmentSession(Method method, String remoteIp, Map<String, String> params) {
+        return segmentSession(method, remoteIp, params, new HashMap<String, String>());
+    }
+
+    /** headers 的键用小写，和 NanoHTTPD 解析后的一样。 */
+    private static IHTTPSession segmentSession(Method method, String remoteIp, Map<String, String> params,
+                                               Map<String, String> headers) {
         IHTTPSession session = mock(IHTTPSession.class);
         when(session.getMethod()).thenReturn(method);
         when(session.getUri()).thenReturn("/hlsseg");
         when(session.getParms()).thenReturn(params);
-        when(session.getHeaders()).thenReturn(new HashMap<String, String>());
+        when(session.getHeaders()).thenReturn(headers);
         when(session.getRemoteIpAddress()).thenReturn(remoteIp);
         return session;
     }
