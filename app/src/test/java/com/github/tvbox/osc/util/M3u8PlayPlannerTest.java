@@ -30,6 +30,9 @@ public class M3u8PlayPlannerTest {
         assertFalse(M3u8PlayPlanner.shouldFetch(URL, false, false));
         assertFalse(M3u8PlayPlanner.shouldFetch("http://127.0.0.1/proxy?x=1", false, false));
         assertFalse(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.mp4", false, false));
+        // 对照：只打开去广告，同样的地址就要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch(URL, true, false));
+        assertTrue(M3u8PlayPlanner.shouldFetch("http://127.0.0.1/proxy?x=1", true, false));
     }
 
     @Test
@@ -46,11 +49,15 @@ public class M3u8PlayPlannerTest {
     @Test
     public void shouldFetchIsFalseWhenPurifyOnAndUrlIsLocalProxyWithPort() {
         assertFalse(M3u8PlayPlanner.shouldFetch("http://127.0.0.1:9978/proxy?do=py", true, false));
+        // 对照：不带端口时要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch("http://127.0.0.1/proxy?do=py", true, false));
     }
 
     @Test
     public void shouldFetchIsFalseWhenPurifyOnAndUrlIsPlainDirectLink() {
         assertFalse(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.mp4", true, false));
+        // 对照：同一主机上的 m3u8 要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.m3u8", true, false));
     }
 
     // ---------- isPlaylist ----------
@@ -73,6 +80,9 @@ public class M3u8PlayPlannerTest {
     @Test
     public void findForwardUrlReturnsEmptyForMediaPlaylist() {
         assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, MEDIA));
+        // 对照：同一地址下只含一个子列表的主列表能找到子列表
+        assertEquals("https://cdn.a.com/path/720/index.m3u8",
+                M3u8PlayPlanner.findForwardUrl(URL, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720/index.m3u8\n"));
     }
 
     @Test
@@ -109,21 +119,34 @@ public class M3u8PlayPlannerTest {
     public void findForwardUrlReturnsEmptyWhenOnlyUriLineIsNotM3u8() {
         String content = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nvideo.mp4\n";
         assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, content));
+        // 对照：同一行换成 m3u8 就能找到
+        assertEquals("https://cdn.a.com/path/video.m3u8",
+                M3u8PlayPlanner.findForwardUrl(URL, content.replace("video.mp4", "video.m3u8")));
     }
 
     @Test
     public void findForwardUrlReturnsEmptyForMasterWithTwoSubPlaylists() {
-        String master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720/index.m3u8\n"
-                + "#EXT-X-STREAM-INF:BANDWIDTH=1600000\n1080/index.m3u8\n";
+        String single = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720/index.m3u8\n";
+        String master = single + "#EXT-X-STREAM-INF:BANDWIDTH=1600000\n1080/index.m3u8\n";
         assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, master));
+        // 对照：只有第一个子列表时能找到它
+        assertEquals("https://cdn.a.com/path/720/index.m3u8", M3u8PlayPlanner.findForwardUrl(URL, single));
     }
 
     @Test
     public void findForwardUrlOnlyLooksAtFirstTenLines() {
+        // 子列表在第 12 行：找不到
+        assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, masterWithSubPlaylistOnLine(12)));
+        // 对照：子列表在第 9 行：能找到
+        assertEquals("https://cdn.a.com/path/720/index.m3u8",
+                M3u8PlayPlanner.findForwardUrl(URL, masterWithSubPlaylistOnLine(9)));
+    }
+
+    /** 第 1 行 #EXTM3U，中间是注释行，子列表 720/index.m3u8 在第 line 行（从 1 数起）。 */
+    private static String masterWithSubPlaylistOnLine(int line) {
         StringBuilder master = new StringBuilder("#EXTM3U\n");
-        for (int i = 0; i < 10; i++) master.append("#EXT-X-COMMENT:").append(i).append('\n');
-        master.append("720/index.m3u8\n");
-        assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, master.toString()));
+        for (int i = 2; i < line; i++) master.append("#EXT-X-COMMENT:").append(i).append('\n');
+        return master.append("720/index.m3u8\n").toString();
     }
 
     // ---------- plan（precache=false） ----------
@@ -193,6 +216,8 @@ public class M3u8PlayPlannerTest {
     public void shouldFetchIsFalseWhenOnlyPrecacheOnAndUrlIsPlainDirectLink() {
         assertFalse(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.mp4", false, true));
         assertFalse(M3u8PlayPlanner.shouldFetch("http://127.0.0.1:9978/proxy?do=py", false, true));
+        // 对照：只打开预缓存，m3u8 地址要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.m3u8", false, true));
     }
 
     // ---------- plan（precache=true） ----------

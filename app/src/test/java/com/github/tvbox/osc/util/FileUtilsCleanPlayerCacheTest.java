@@ -157,18 +157,30 @@ public class FileUtilsCleanPlayerCacheTest {
     public void keepsOtherFilesInExternalCacheDir() throws IOException {
         File keep = newFile(externalCacheDir, "qjscache_x.js");
         File keepDir = newFile(externalCacheDir, "other/c.bin");
+        File lookalike = newFile(externalCacheDir, HlsPrecache.CACHE_DIR_NAME + "-other/d.bin");
+        newFile(externalCacheDir, "ijkcaches/a.bin");
+        newFile(externalCacheDir, HlsPrecache.CACHE_DIR_NAME + "/s1/a.seg");
 
         clean();
 
         assertTrue(keep.exists());
         assertTrue(keepDir.exists());
+        assertTrue(lookalike.exists());
+        // 对照：同一次清理确实删掉了要清理的目录
+        assertFalse(new File(externalCacheDir, "ijkcaches").exists());
+        assertFalse(hlsCache().exists());
     }
 
     @Test
-    public void doesNothingWhenDirectoriesAreMissing() {
+    public void skipsMissingDirectoriesAndStillCleansTheRest() throws IOException {
+        // thunder、jpali/Downloads、hlscache 都不存在，只有 ijkcaches 在
+        newFile(externalCacheDir, "ijkcaches/a.bin");
+
         clean();
 
         assertTrue(cacheDir.isDirectory());
         assertTrue(externalCacheDir.isDirectory());
+        // 对照：缺失的目录不影响清理其余的
+        assertFalse(new File(externalCacheDir, "ijkcaches").exists());
     }
 }
