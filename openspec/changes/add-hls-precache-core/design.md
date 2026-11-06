@@ -103,6 +103,21 @@ public final class HlsPrecache {
     public void endSession();
 
     /**
+     * dev-test 返工时新增（纯增量，上面两个方法的签名和语义不变）。
+     * 同 rewrite(4 参)，并把新会话记在 owner 名下。owner 由播放页自己 new 一个普通 Object 传入，
+     * 用来区分「是谁建的会话」，不能传 Context（单例会持有它，直到会话被替换或结束）。
+     * 原因：旧页面的 onDestroy 可能晚于新页面的 rewrite 才到达（比如先 finish 旧 DetailActivity 再启动新的），
+     * 无条件的 endSession() 会结束新页面的会话。
+     */
+    public String rewrite(String playlistUrl, String content, Map<String, String> headers, int port, Object owner);
+
+    /**
+     * dev-test 返工时新增。只在当前会话的 owner 和传入的 owner 是同一个对象（==）时结束它，否则什么都不做。
+     * owner 为 null 时什么都不做。线程与异常语义同 endSession()。S3 的播放页一律用这个版本结束会话。
+     */
+    public void endSession(Object owner);
+
+    /**
      * 分片代理的入口，由 S2 在 NanoHTTPD 的请求线程上调用。
      *
      * @param sessionId session.getParms().get(PARAM_SESSION)，可以为 null
