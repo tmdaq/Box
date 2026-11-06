@@ -16,6 +16,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * 可控的回源替身：按 URL 预设状态码、字节或异常，可以用闸门卡住响应头或 body，记录每个 URL 的请求。
  * 没有预设的 URL 返回 200，body 是 {@link #bytesFor(String, int)} 生成的 defaultSize 个字节。
+ * 另外统计正在进行的回源数（execute 开始到 body 关闭或抛异常）和它的最大值。
  */
 final class FakeSegmentDownloader implements SegmentDownloader {
 
@@ -74,6 +75,8 @@ final class FakeSegmentDownloader implements SegmentDownloader {
     private final List<String> requested = new ArrayList<>();
     private final Map<String, Map<String, String>> lastHeaders = new HashMap<>();
     private final List<String> cancelled = new ArrayList<>();
+    private int inFlight;
+    private int maxInFlight;
     private volatile int defaultSize = 100;
     private volatile CountDownLatch defaultBodyGate;
     private volatile int defaultBodyGateAfter;
@@ -123,6 +126,31 @@ final class FakeSegmentDownloader implements SegmentDownloader {
         return cancelled.contains(url);
     }
 
+    /** 正在进行的回源数。 */
+    synchronized int inFlight() {
+        return inFlight;
+    }
+
+    /** 上次 {@link #resetMaxInFlight()} 以来同时进行的回源数的最大值。 */
+    synchronized int maxInFlight() {
+        return maxInFlight;
+    }
+
+    synchronized void resetMaxInFlight() {
+        maxInFlight = inFlight;
+    }
+
+    private synchronized void begin(String url, Map<String, String> headers) {
+        requested.add(url);
+        lastHeaders.put(url, headers);
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+    }
+
+    private synchronized void end() {
+        inFlight--;
+    }
+
     @Override
     public Call newCall(String url, Map<String, String> headers) {
         return new FakeCall(url, headers == null ? null : new HashMap<>(headers));
@@ -148,13 +176,15 @@ final class FakeSegmentDownloader implements SegmentDownloader {
 
         @Override
         public Source execute() throws IOException {
-            synchronized (FakeSegmentDownloader.this) {
-                requested.add(url);
-                lastHeaders.put(url, headers);
-            }
+            begin(url, headers);
             Plan plan = planFor(url);
-            await(plan.headersGate);
-            if (plan.error != null) throw plan.error;
+            try {
+                await(plan.headersGate);
+                if (plan.error != null) throw plan.error;
+            } catch (IOException e) {
+                end();
+                throw e;
+            }
             byte[] body = plan.body == null ? new byte[0] : plan.body;
             long length = plan.contentLength == null ? body.length : plan.contentLength;
             return new Source(plan.code, new GatedStream(body, plan), length, plan.contentType);
@@ -189,6 +219,7 @@ final class FakeSegmentDownloader implements SegmentDownloader {
             private final byte[] data;
             private final Plan plan;
             private int pos;
+            private boolean closed;
 
             GatedStream(byte[] data, Plan plan) {
                 this.data = data;
@@ -212,6 +243,15 @@ final class FakeSegmentDownloader implements SegmentDownloader {
                 System.arraycopy(data, pos, b, off, n);
                 pos += n;
                 return n;
+            }
+
+            @Override
+            public void close() {
+                synchronized (this) {
+                    if (closed) return;
+                    closed = true;
+                }
+                end();
             }
         }
     }

@@ -200,6 +200,11 @@ final class SegmentDownload implements Runnable {
         return new Reader(new FileInputStream(temp));
     }
 
+    /** 不阻塞。 */
+    synchronized State state() {
+        return state;
+    }
+
     synchronized int httpCode() {
         return httpCode;
     }
