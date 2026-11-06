@@ -32,6 +32,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -571,6 +572,69 @@ public class PrecacheSessionTest {
         play(0);
 
         assertFalse(store.isCommitted("stale"));
+    }
+
+    // ---- 持会话锁时不做 IO（D5） ----
+
+    @Test
+    public void closeDoesNotWaitForAFileDeletionOfAnotherRequest() throws Exception {
+        CountDownLatch deleting = new CountDownLatch(1);
+        CountDownLatch release = gate();
+        store = new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            void delete(File file) {
+                deleting.countDown();
+                awaitQuietly(() -> release.getCount() == 0);
+                super.delete(file);
+            }
+        };
+        newSession(100);
+        play(0);
+        awaitIdle();
+
+        // 跳转要删除旧窗口里的分片，删除卡住
+        Future<SegmentResponse> jump = pool.submit(() -> session.open(50));
+        assertTrue(deleting.await(5, TimeUnit.SECONDS));
+
+        assertClosesPromptly();
+        release.countDown();
+        jump.get(5, TimeUnit.SECONDS).close();
+    }
+
+    @Test
+    public void closeDoesNotWaitForADiskLookupOfAnotherRequest() throws Exception {
+        CountDownLatch lookingUp = new CountDownLatch(1);
+        CountDownLatch release = gate();
+        AtomicBoolean armed = new AtomicBoolean();
+        store = new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            File committedFile(String key) {
+                if (armed.getAndSet(false)) {
+                    lookingUp.countDown();
+                    awaitQuietly(() -> release.getCount() == 0);
+                }
+                return super.committedFile(key);
+            }
+        };
+        newSession(100);
+        play(0);
+        awaitIdle();
+        armed.set(true);
+
+        // 命中查找（stat、打开文件）卡住
+        Future<SegmentResponse> hit = pool.submit(() -> session.open(1));
+        assertTrue(lookingUp.await(5, TimeUnit.SECONDS));
+
+        assertClosesPromptly();
+        release.countDown();
+        hit.get(5, TimeUnit.SECONDS).close();
+    }
+
+    /** rewrite、endSession 在主线程上调用 close()，它不能等别的线程正在做的磁盘 IO。 */
+    private void assertClosesPromptly() throws Exception {
+        Future<?> close = pool.submit(session::close);
+        close.get(2, TimeUnit.SECONDS);
+        assertEquals(410, session.open(2).status);
     }
 
     // ---- 磁盘上限 ----

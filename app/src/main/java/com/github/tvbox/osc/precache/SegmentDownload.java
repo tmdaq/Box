@@ -32,15 +32,16 @@ final class SegmentDownload implements Runnable {
     private final SegmentStore store;
     private final Listener listener;
 
-    // 以下字段由本对象的锁保护
-    private State state = State.PENDING;
+    // 以下字段只在本对象的锁里写。volatile 的几个可以不加锁读：会话持自己的锁时会读它们，
+    // 不能去等本对象的锁，因为本对象持锁时会做 rename 和打开文件（design.md D5）。
+    private volatile State state = State.PENDING;
     private SegmentDownloader.Call call;
     private File temp;
     private long bytesWritten;
-    private int httpCode;
-    private long contentLength = -1;
-    private String contentType;
-    private boolean throttleSignal;
+    private volatile int httpCode;
+    private volatile long contentLength = -1;
+    private volatile String contentType;
+    private volatile boolean throttleSignal;
 
     SegmentDownload(HlsSegment seg, Map<String, String> headers, boolean prefetch,
                     SegmentDownloader downloader, SegmentStore store, Listener listener) {
@@ -210,27 +211,27 @@ final class SegmentDownload implements Runnable {
         finish(State.FAILED, false);
     }
 
-    /** 不阻塞。 */
-    synchronized State state() {
+    /** 以下读取都不加锁、不阻塞。 */
+    State state() {
         return state;
     }
 
-    synchronized int httpCode() {
+    int httpCode() {
         return httpCode;
     }
 
     /** -1 表示未知。 */
-    synchronized long contentLength() {
+    long contentLength() {
         return contentLength;
     }
 
     /** 源站的 Content-Type，可能为 null。 */
-    synchronized String contentType() {
+    String contentType() {
         return contentType;
     }
 
     /** 结果是 403/429/503 或连接被拒时为 true。 */
-    synchronized boolean isThrottleSignal() {
+    boolean isThrottleSignal() {
         return throttleSignal;
     }
 
@@ -238,13 +239,18 @@ final class SegmentDownload implements Runnable {
         return prefetch;
     }
 
-    synchronized boolean isFinished() {
-        return state != State.PENDING && state != State.STREAMING;
+    boolean isFinished() {
+        return isFinished(state);
     }
 
     /** 还在下载，或者已经提交：新来的读者可以等它或者直接读它，不需要再下载一次。 */
-    synchronized boolean canServe() {
-        return !isFinished() || state == State.COMPLETED;
+    boolean canServe() {
+        State s = state;
+        return !isFinished(s) || s == State.COMPLETED;
+    }
+
+    private static boolean isFinished(State s) {
+        return s != State.PENDING && s != State.STREAMING;
     }
 
     /** 任意线程，不阻塞。取消后不会提交，读者抛 IOException。 */

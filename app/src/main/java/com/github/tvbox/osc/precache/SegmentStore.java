@@ -40,12 +40,21 @@ class SegmentStore {
         return playlistUrl;
     }
 
-    /** 已提交而且文件还在时返回文件；文件被外部删掉时删除这条记录，返回 null。会做一次 stat。 */
-    synchronized File committedFile(String key) {
-        if (!committed.containsKey(key)) return null;
+    /**
+     * 已提交而且文件还在时返回文件；文件被外部删掉时删除这条记录，返回 null。
+     * 会做一次 stat，在本对象的锁外做（本类所有的 IO 都在锁外，锁里只有内存操作）。
+     */
+    File committedFile(String key) {
+        Entry entry;
+        synchronized (this) {
+            entry = committed.get(key);
+        }
+        if (entry == null) return null;
         File file = fileOf(key);
         if (file.isFile()) return file;
-        forget(key);
+        synchronized (this) {
+            if (committed.get(key) == entry) forget(key);
+        }
         return null;
     }
 
@@ -67,19 +76,41 @@ class SegmentStore {
         return temp;
     }
 
-    synchronized void commit(String key, File temp, long size, String contentType) throws IOException {
+    void commit(String key, File temp, long size, String contentType) throws IOException {
         File target = fileOf(key);
-        forget(key);
+        synchronized (this) {
+            forget(key);
+        }
         target.delete();
         if (!temp.renameTo(target)) throw new IOException("cannot rename " + temp + " to " + target);
-        committed.put(key, new Entry(size, contentType));
-        committedBytes += size;
+        synchronized (this) {
+            forget(key);
+            committed.put(key, new Entry(size, contentType));
+            committedBytes += size;
+        }
     }
 
     /** 删文件和记录。 */
-    synchronized void remove(String key) {
+    void remove(String key) {
+        synchronized (this) {
+            forget(key);
+        }
+        delete(fileOf(key));
+    }
+
+    /**
+     * 只删记录，不做 IO，返回要删的文件；没有这条记录时返回 null。
+     * 给持会话锁的淘汰用：记录立刻摘掉（占用字节随即减少），文件在释放会话锁之后用 {@link #delete} 删。
+     */
+    synchronized File detach(String key) {
+        if (!committed.containsKey(key)) return null;
         forget(key);
-        fileOf(key).delete();
+        return fileOf(key);
+    }
+
+    /** 删除一个分片文件。 */
+    void delete(File file) {
+        file.delete();
     }
 
     /** 快照。 */

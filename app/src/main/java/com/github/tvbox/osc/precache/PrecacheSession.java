@@ -5,6 +5,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.ConnectException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -16,7 +17,8 @@ import java.util.concurrent.Executor;
 /**
  * 一个预缓存会话（design.md D8–D12）：维护锚点，按预缓存窗口调度预缓存下载，处理跳转、回看淘汰、
  * 磁盘上限、限流降并发和磁盘故障降级，并为播放器的分片请求给出结果。
- * 可变状态都由本对象的锁保护；只在锁外阻塞（等响应头、纯转发）。
+ * 可变状态都由本对象的锁保护。持锁时只做内存操作：磁盘 IO（stat、打开、删除文件）和取消下载都在锁外，
+ * 阻塞（等响应头、纯转发）也在锁外（design.md D5）。
  */
 final class PrecacheSession implements SegmentDownload.Listener {
 
@@ -75,13 +77,17 @@ final class PrecacheSession implements SegmentDownload.Listener {
         HlsSegment seg = segments.get(index);
         // 读者打不开，或者等的下载被跳转取消时，按未命中重来一次
         for (int attempt = 0; attempt < 2; attempt++) {
-            Lookup found;
+            Deferred later = new Deferred();
+            boolean forwardOnly;
             synchronized (this) {
                 if (closed) return SegmentResponse.error(410);
-                if (attempt == 0) moveAnchor(index);
-                found = lookup(seg);
-                pump();
+                if (attempt == 0) moveAnchor(index, later);
+                forwardOnly = degraded;
             }
+            later.run();
+            if (forwardOnly) return forward(seg);
+            Lookup found = lookup(seg);
+            if (found == null) return SegmentResponse.error(410);
             if (found.response != null) return found.response;
             if (found.download == null) return forward(seg);
             SegmentResponse response = respond(found.download, seg);
@@ -90,23 +96,29 @@ final class PrecacheSession implements SegmentDownload.Listener {
         return SegmentResponse.error(502);
     }
 
-    /** 不阻塞：标记关闭，取消全部下载。可以重复调用。 */
-    synchronized void close() {
-        closed = true;
-        for (SegmentDownload d : downloads.values()) d.cancel();
+    /** 不阻塞：标记关闭，取消全部下载。可以重复调用。持会话锁时只做内存操作，取消在锁外进行。 */
+    void close() {
+        List<SegmentDownload> all;
+        synchronized (this) {
+            closed = true;
+            all = new ArrayList<>(downloads.values());
+        }
+        for (SegmentDownload d : all) d.cancel();
     }
 
     @Override
     public void onFinished(SegmentDownload d) {
         SegmentDownload.State state = d.state();
         int index = d.segment().index;
+        Deferred later = new Deferred();
         synchronized (this) {
             if (downloads.get(index) == d) downloads.remove(index);
             recordSignal(d.isThrottleSignal());
-            if (state == SegmentDownload.State.DISK_ERROR) degrade();
+            if (state == SegmentDownload.State.DISK_ERROR) degrade(later);
             if (d.isPrefetch() && isFailure(state)) prefetchFailed.add(index);
-            pump();
+            pump(later);
         }
+        later.run();
     }
 
     // ---- open 的各步 ----
@@ -122,22 +134,43 @@ final class PrecacheSession implements SegmentDownload.Listener {
         }
     }
 
-    private static final Lookup FORWARD = new Lookup(null, null);
-
+    /**
+     * 先在锁外查磁盘，再在锁里加入正在进行（或刚提交）的下载，都没有时开始一个按需下载。
+     * 会话已关闭时返回 null。
+     */
     private Lookup lookup(HlsSegment seg) {
-        if (degraded) return FORWARD;
-        SegmentResponse hit = openCommitted(seg);
-        if (hit != null) return new Lookup(hit, null);
-        if (degraded) return FORWARD;
-        SegmentDownload d = downloads.get(seg.index);
-        if (d == null || !d.canServe()) {
-            prefetchFailed.remove(seg.index);
-            d = start(seg, false);
+        for (int look = 0; ; look++) {
+            SegmentResponse hit = openCommitted(seg);
+            Deferred later = new Deferred();
+            SegmentDownload d = null;
+            boolean committedMeanwhile = false;
+            synchronized (this) {
+                if (closed) {
+                    if (hit != null) hit.close();
+                    return null;
+                }
+                if (hit == null && !degraded) {
+                    d = downloads.get(seg.index);
+                    if (d == null || !d.canServe()) {
+                        // 查完磁盘、拿到锁之前，下载刚好提交并结束了：再查一次磁盘，不重复下载
+                        committedMeanwhile = look == 0 && store.isCommitted(seg.key);
+                        d = committedMeanwhile ? null : startOnDemand(seg);
+                    }
+                }
+                pump(later);
+            }
+            later.run();
+            if (!committedMeanwhile) return new Lookup(hit, d);
         }
-        return new Lookup(null, d);
     }
 
-    /** 命中时返回 200；文件已不存在时按未命中返回 null；文件还在却打不开时降级并返回 null。 */
+    /** 按需下载不检查并发和磁盘上限。在锁里调用。 */
+    private SegmentDownload startOnDemand(HlsSegment seg) {
+        prefetchFailed.remove(seg.index);
+        return start(seg, false);
+    }
+
+    /** 在锁外调用（stat、打开文件）。命中时返回 200；文件已不存在时按未命中返回 null；文件还在却打不开时降级并返回 null。 */
     private SegmentResponse openCommitted(HlsSegment seg) {
         File file = store.committedFile(seg.key);
         if (file == null) return null;
@@ -147,7 +180,7 @@ final class PrecacheSession implements SegmentDownload.Listener {
             return new SegmentResponse(200, in, length, contentType(store.contentType(seg.key), seg.url));
         } catch (IOException e) {
             if (file.exists()) {
-                degrade();
+                degradeNow();
             } else {
                 store.remove(seg.key);
             }
@@ -171,9 +204,7 @@ final class PrecacheSession implements SegmentDownload.Listener {
             case NETWORK_ERROR:
                 return SegmentResponse.error(502);
             case DISK_ERROR:
-                synchronized (this) {
-                    degrade();
-                }
+                degradeNow();
                 return forward(seg);
             case CANCELLED:
                 synchronized (this) {
@@ -212,10 +243,35 @@ final class PrecacheSession implements SegmentDownload.Listener {
         return contentLength >= 0 ? contentLength : SegmentResponse.UNKNOWN_LENGTH;
     }
 
-    // ---- 调度（都在锁里调用） ----
+    // ---- 调度（都在锁里调用，只做内存操作；取消和删文件记进 later，释放锁之后执行） ----
+
+    /**
+     * 持会话锁时攒下的取消和删除，释放锁之后由同一个线程执行（D5）。
+     * 这样会话锁上不会有 IO，主线程上的 close() 不会等别的线程删文件、打开文件。
+     */
+    private final class Deferred {
+        private final List<SegmentDownload> cancels = new ArrayList<>();
+        private final List<File> deletions = new ArrayList<>();
+
+        void cancel(SegmentDownload d) {
+            cancels.add(d);
+        }
+
+        void delete(File file) {
+            if (file != null) deletions.add(file);
+        }
+
+        /** 在锁外调用。执行后清空，可以再次攒。 */
+        void run() {
+            for (SegmentDownload d : cancels) d.cancel();
+            for (File file : deletions) store.delete(file);
+            cancels.clear();
+            deletions.clear();
+        }
+    }
 
     /** 更新锚点；跳转时取消新窗口外的预缓存下载；锚点变化时淘汰窗口和回看范围外的分片。 */
-    private void moveAnchor(int index) {
+    private void moveAnchor(int index, Deferred later) {
         boolean jump = PrecacheWindow.isJump(anchor, index);
         boolean changed = anchor != index;
         anchor = index;
@@ -223,29 +279,29 @@ final class PrecacheSession implements SegmentDownload.Listener {
         if (jump) {
             for (Map.Entry<Integer, SegmentDownload> e : downloads.entrySet()) {
                 int k = e.getKey();
-                if (e.getValue().isPrefetch() && (k < anchor || k > end)) e.getValue().cancel();
+                if (e.getValue().isPrefetch() && (k < anchor || k > end)) later.cancel(e.getValue());
             }
         }
-        if (changed && !degraded) evictOutside(window.behindStart(anchor, config.behindMs), end);
+        if (changed && !degraded) evictOutside(window.behindStart(anchor, config.behindMs), end, later);
     }
 
-    /** 删除序号不在 [from, to] 里的已提交分片，以及不属于当前列表的 key。 */
-    private void evictOutside(int from, int to) {
+    /** 淘汰序号不在 [from, to] 里的已提交分片，以及不属于当前列表的 key。 */
+    private void evictOutside(int from, int to, Deferred later) {
         for (String key : store.committedKeys()) {
             Integer k = indexByKey.get(key);
-            if (k == null || k < from || k > to) store.remove(key);
+            if (k == null || k < from || k > to) later.delete(store.detach(key));
         }
     }
 
     /** 按升序给窗口里还没下载的分片开始预缓存下载，直到并发或磁盘上限。 */
-    private void pump() {
+    private void pump(Deferred later) {
         if (closed || degraded || anchor < 0) return;
         int allowed = throttled ? config.throttledConcurrency : config.maxConcurrency;
         int end = window.aheadEnd(anchor, config.aheadMs);
         for (int k = anchor + 1; k <= end && downloads.size() < allowed; k++) {
             HlsSegment seg = segments.get(k);
             if (store.isCommitted(seg.key) || downloads.containsKey(k) || prefetchFailed.contains(k)) continue;
-            if (!fits() && !evictBehindAnchor()) break;
+            if (!fits() && !evictBehindAnchor(later)) break;
             start(seg, true);
         }
     }
@@ -275,12 +331,12 @@ final class PrecacheSession implements SegmentDownload.Listener {
         return store.committedBytes() + reserved + estimate <= config.capBytes;
     }
 
-    /** 按序号从小到大删除锚点之前已提交的分片，直到放得下；返回是否放得下。 */
-    private boolean evictBehindAnchor() {
+    /** 按序号从小到大淘汰锚点之前已提交的分片，直到放得下；返回是否放得下。 */
+    private boolean evictBehindAnchor(Deferred later) {
         for (int k = 0; k < anchor; k++) {
             String key = segments.get(k).key;
             if (!store.isCommitted(key)) continue;
-            store.remove(key);
+            later.delete(store.detach(key));
             if (fits()) return true;
         }
         return false;
@@ -293,11 +349,20 @@ final class PrecacheSession implements SegmentDownload.Listener {
     }
 
     /** 降级为纯转发：取消全部预缓存下载，之后不再 pump；正在进行的按需下载继续。 */
-    private void degrade() {
+    private void degrade(Deferred later) {
         degraded = true;
         for (SegmentDownload d : downloads.values()) {
-            if (d.isPrefetch()) d.cancel();
+            if (d.isPrefetch()) later.cancel(d);
         }
+    }
+
+    /** 在锁外调用的 degrade。 */
+    private void degradeNow() {
+        Deferred later = new Deferred();
+        synchronized (this) {
+            degrade(later);
+        }
+        later.run();
     }
 
     private static boolean isFailure(SegmentDownload.State state) {
