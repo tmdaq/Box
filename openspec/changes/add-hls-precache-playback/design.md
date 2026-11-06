@@ -1,6 +1,6 @@
 ## Context
 
-动机见 proposal.md 的 Why；方案选型见 `docs/adr/0001-hls-precache-via-local-segment-proxy.md`；术语见 `GLOSSARY.md`；行为要求见本 change 的 `specs/`。预缓存核心的接口以 `openspec/changes/add-hls-precache-core/design.md`「跨 change 接口」一节为准，本 change 只用其中 `HlsPrecache` 的 `CACHE_DIR_NAME`、`get()`、`setCacheRoot`、`rewrite`、`endSession`。
+动机见 proposal.md 的 Why；方案选型见 `docs/adr/0001-hls-precache-via-local-segment-proxy.md`；术语见 `GLOSSARY.md`；行为要求见本 change 的 `specs/`。预缓存核心的接口以 `openspec/changes/add-hls-precache-core/design.md`「跨 change 接口」一节为准，本 change 只用其中 `HlsPrecache` 的 `CACHE_DIR_NAME`、`get()`、`setCacheRoot`、带 owner 的 `rewrite(..., Object owner)` 和 `endSession(Object owner)`（见 D6「只结束本页的会话」）。
 
 下文代码路径默认相对 `app/src/main/java/com/github/tvbox/osc/`，资源路径相对 `app/src/main/`。
 
@@ -58,7 +58,7 @@ public final class M3u8PlayPlanner {
     /** 对应 M3U8.purify，调用方传 M3U8::purify。 */
     public interface Purifier { String purify(String tsUrlPre, String content); }
 
-    /** 对应 HlsPrecache.rewrite，调用方传 HlsPrecache.get()::rewrite。 */
+    /** 对应 HlsPrecache.rewrite，调用方传 (u, c, h, port) -> HlsPrecache.get().rewrite(u, c, h, port, owner)。 */
     public interface Rewriter { String rewrite(String playlistUrl, String content, Map<String, String> headers, int port); }
 
     /**
@@ -169,7 +169,8 @@ private void playM3u8(String playlistUrl, String finalUrl, String content, HashM
                       boolean purify, boolean precache) {
     if (!isAdded()) return;               // PlayActivity：if (isFinishing() || isDestroyed()) return;
     M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
-            RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
+            RemoteServer.serverPort, M3U8::purify,
+            (u, c, h, port) -> HlsPrecache.get().rewrite(u, c, h, port, owner));   // owner = precacheOwner 的局部副本（D6）
     if (p.setM3u8Content) RemoteServer.m3u8Content = p.m3u8Content;
     startPlayUrl(p.playUrl, headers, p.precached);
 }
@@ -181,8 +182,8 @@ private boolean isExternalPlayer() {
 ```
 
 - `purify` 和 `precache` 在 `playUrl` 入口读一次，回调里用同一份值，避免拉取期间设置变化导致前后判断不一致。
-- `HlsPrecache.get()::rewrite` 在主线程的 OkGo 回调里调用，S1 保证它不做网络 IO 和阻塞磁盘 IO。`M3U8.purify` 本来就在这里调用。
-- 方法引用不捕获 `Context`、Fragment 或 Activity。
+- `HlsPrecache.get().rewrite(..., owner)` 在主线程的 OkGo 回调里调用，S1 保证它不做网络 IO 和阻塞磁盘 IO。`M3U8.purify` 本来就在这里调用。
+- 方法引用和 lambda 不捕获 `Context`、Fragment 或 Activity：lambda 只捕获局部变量 `owner`（`precacheOwner` 的副本），而且只在 `plan()` 调用期间使用。
 - `playUrl(url, headers)` 的签名不变，现有的十几个调用点（解析 :1516/:1578/:1706、嗅探 :2028/:2215、`autoRetryFromLoadFoundVideoUrls` :1272、播放结果 :1031）都不用改，默认允许预缓存。
 
 ### D3 特殊链接的排除
@@ -222,7 +223,7 @@ void startPlayUrl(String url, HashMap<String, String> headers) {
 }
 
 private void startPlayUrl(String url, HashMap<String, String> headers, boolean keepPrecacheSession) {
-    if (!keepPrecacheSession) HlsPrecache.get().endSession();
+    if (!keepPrecacheSession) HlsPrecache.get().endSession(precacheOwner);   // 只结束本页的会话（D6）
     // 以下是原 startPlayUrl 的主体，逐字不变（包括 isAdded 检查、runOnUiThread、外部播放器分支）
 }
 ```
@@ -250,7 +251,7 @@ private void startPlayUrl(String url, HashMap<String, String> headers, boolean k
 
 | 调用点 | 位置 | 说明 |
 | --- | --- | --- |
-| `PlayFragment.onDestroyView` | 在 `mVideoView.release()` 之后加 `HlsPrecache.get().endSession()` | 离开详情页（返回、被系统回收） |
+| `PlayFragment.onDestroyView` | 在 `mVideoView.release()` 之后加 `HlsPrecache.get().endSession(precacheOwner)` | 离开详情页（返回、被系统回收） |
 | `PlayActivity.onDestroy` | 在 `mVideoView.release()` 之后加同样一行 | 离开全屏播放页 |
 | `PlayActivity.onPictureInPictureModeChanged` 的 `else` 分支 | 在 `if (onStopCalled) { mVideoView.release(); }` 里，release 之后加同样一行 | 用户关掉画中画小窗，播放器已经释放；Activity 不一定马上销毁，不在这里结束的话，会话会一直留到 Activity 销毁 |
 
@@ -258,6 +259,13 @@ private void startPlayUrl(String url, HashMap<String, String> headers, boolean k
 
 - `PlayFragment.onDestroyView`、`PlayActivity.onDestroy` 在 `endSession` 之前调 `cancelM3u8Fetch()`，取消还在进行的 `m3u8-1` / `m3u8-2` 请求；
 - `playM3u8` 在调用 `plan()` 之前检查页面还在不在（PlayFragment 用 `isAdded()`，PlayActivity 用 `isFinishing() || isDestroyed()`），不在就直接返回，不调用 `rewrite`。拉取失败、内容不是 m3u8 的回退走 `startPlayUrl`，它本来就只结束会话、不建会话，页面不在时由它自己的检查返回（PlayFragment 是 `isAdded()`，PlayActivity 是 `mVideoView == null`）。
+
+**只结束本页的会话**：`BaseActivity` 后台设置为画中画时（`BaseActivity.java:254-260`）和推送 `receiver/DetailReceiver.java:24-28` 都是先 finish 旧的 DetailActivity、再启动新的。旧页面的 `onDestroyView` / `onDestroy` 可能在新页面已经 `rewrite` 之后才执行；无条件的 `endSession()` 会把新页面的会话结束掉，新播放器之后请求分片拿到 410。所以：
+
+- PlayFragment、PlayActivity 各有一个字段 `private final Object precacheOwner = new Object();`。只能是普通 `Object`，不能是匿名内部类或 lambda，否则会捕获 Fragment / Activity，而单例会一直持有它直到会话被替换或结束。
+- `playM3u8` 里调 `rewrite(..., owner)`，把新会话记在本页名下。
+- 所有结束会话的地方都用 `endSession(precacheOwner)`：`startPlayUrl` 里不保留会话的分支、`PlayFragment.onDestroyView`、`PlayActivity.onDestroy`、`PlayActivity` 关闭画中画的分支。当前会话不是本页建的时，S1 什么都不做。
+- 「开始播放一个不使用预缓存的内容时结束上一个会话」因此也只针对本页自己建的会话；别的页面建的会话由那个页面离开时结束，或者被下一次 `rewrite` 替换（S1 的 `rewrite` 不管 owner，总是替换当前会话）。
 
 不加的地方：`onPause`、`onStop`、`onHiddenChanged`、进入画中画、DetailActivity 的小窗与全屏切换、后台播放服务。这些都只是暂停或继续播放，不算离开。DetailActivity 关闭画中画时只暂停不释放（:1215），所以也不结束。
 
@@ -396,6 +404,7 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
    - 「设置 → 窗口预览」开启，进入详情页：小窗自动播放，看目录出现会话目录。把小窗切到全屏，再切回小窗：会话目录名不变。按返回离开详情页：目录被清空。
    - 「设置 → 后台」设为「开启」，在小窗播放时按 Home 键：继续播放，会话目录仍在；回到 App 继续播放，目录名不变。
    - 「设置 → 后台」设为「画中画」，在全屏播放页按 Home 键：进入画中画，会话目录仍在，在画中画里按下一集会换成新的会话目录；关闭画中画小窗后，目录被清空。
+   - **旧页面晚到的销毁**（需要 S1 的 owner 实现合并后验证）：「设置 → 后台」设为「画中画」，详情页 A 小窗播放时按 Home 进入画中画；回到 App 首页打开另一部影片 B 的详情页（`BaseActivity.jumpActivity` 会先 finish A），B 的小窗开始播放。看目录：B 的会话目录存在，并且在 A 销毁之后仍然存在；B 连续播放 2 分钟、拖动一次进度，不出现重新加载，`adb logcat | grep -i hlsseg` 没有 410。再用推送打开详情页（`adb shell am broadcast -a android.content.movie.detail.Action --es id <id> --es sourceKey <key>`）重复一次。
    - 安装 MX Player，把播放器选为 MX，开启预缓存后播放同一片源：MX 能正常播放；在 MX Player 的「属性 / 信息」里看到的播放地址和关闭预缓存时完全相同（去广告成功时是 `http://127.0.0.1:<端口>/m3u8`；在设备上用 `curl` 取这个地址，分片指向源站，不含 `/hlsseg`）；看目录，没有会话目录，之前内置播放器留下的会话目录也被删除。
    - 存储空间（WebDAV / Alist）里播放一个 m3u8 文件、播放一个迅雷磁力视频：都能正常播放，不出现会话目录。
 9. **局域网请求返回 403**（分片代理端点属于 S2，需要 S1、S2、S3 合并后在集成分支上验证）
@@ -411,6 +420,7 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
 - **[风险] 启动时在主线程删除 `hlscache/`。** → 沿用 `cleanPlayerCache()` 现有的时机和线程。挪到后台会和新会话目录产生竞争（D9）。正常退出时会话目录已经在后台删掉，只有进程被杀时才会留下，最多一个会话（300MB）。
 - **[取舍] `startPlayUrl` 默认结束会话，只有 `precached` 的播放保留。** 一处兜底覆盖所有不改写的分支，代价是开关关闭时每次播放多一次空操作调用。
 - **[取舍] 特殊链接靠调用点传参排除，而不是按 URL 识别。** 以后新增的特殊链接如果走 `playUrl(url, headers)` 的默认重载，会被当作普通点播；但普通点播的判断本身还要求地址含 `.m3u8` 且内容是带 ENDLIST 的媒体列表，误判的后果最多是这一类链接也被预缓存。
+- **[风险] 旧页面晚到的销毁结束新页面的会话。** 先 finish 旧 DetailActivity 再启动新的（画中画后台设置、推送）时，旧页面的 `onDestroy` 可能晚于新页面的 `rewrite`。→ 会话记在页面自己的 `precacheOwner` 名下，旧页面只能结束自己建的会话（D6「只结束本页的会话」）。代价：B 页面播放不走预缓存的内容时，不会结束 A 页面留下的会话，它要等 A 离开或被下一次 `rewrite` 替换；两个播放页同时存在本来就是第一条风险接受的场景。
 - **[取舍] 关闭画中画小窗时结束会话（D6 第三行）。** 需求只点名了 `onDestroy`，这里多加一处，因为此时播放器已经释放，留着会话只会占磁盘。
 - **[依赖] 编译依赖 S1 的 `HlsPrecache`。** S1 的接口骨架会先在 change 分支上提交，`M3u8PlayPlanner` 本身不依赖它，可以先做。
 

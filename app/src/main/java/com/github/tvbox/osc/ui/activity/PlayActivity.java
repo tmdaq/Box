@@ -786,8 +786,10 @@ public class PlayActivity extends BaseActivity {
     private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
                           boolean purify, boolean precache) {
         if (isFinishing() || isDestroyed()) return;
+        final Object owner = precacheOwner;   // lambda 只捕获 owner，不捕获页面
         M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
-                RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
+                RemoteServer.serverPort, M3U8::purify,
+                (u, c, h, port) -> HlsPrecache.get().rewrite(u, c, h, port, owner));
         if (p.setM3u8Content) RemoteServer.m3u8Content = p.m3u8Content;
         startPlayUrl(p.playUrl, headers, p.precached);
     }
@@ -803,7 +805,7 @@ public class PlayActivity extends BaseActivity {
 
     /** keepPrecacheSession：只有刚改写成功（plan.precached）时保留预缓存会话，其余播放都先结束上一个会话。 */
     private void startPlayUrl(String url, HashMap<String, String> headers, boolean keepPrecacheSession) {
-        if (!keepPrecacheSession) HlsPrecache.get().endSession();
+        if (!keepPrecacheSession) HlsPrecache.get().endSession(precacheOwner);
         final String finalUrl = url;
         runOnUiThread(new Runnable() {
             @Override
@@ -1270,7 +1272,7 @@ public class PlayActivity extends BaseActivity {
             // Closed playback
             if (onStopCalled) {
                 mVideoView.release();
-                HlsPrecache.get().endSession();
+                HlsPrecache.get().endSession(precacheOwner);
             }
             unregisterReceiver(pipActionReceiver);
             pipActionReceiver = null;
@@ -1292,7 +1294,7 @@ public class PlayActivity extends BaseActivity {
             mVideoView = null;
         }
         cancelM3u8Fetch();
-        HlsPrecache.get().endSession();
+        HlsPrecache.get().endSession(precacheOwner);
         stopLoadWebView(true);
         stopParse();
         Thunder.stop(false); // 停止磁力下载
@@ -1302,6 +1304,11 @@ public class PlayActivity extends BaseActivity {
 
     private VodInfo mVodInfo;
     private JSONObject mVodPlayerCfg;
+    /**
+     * 本页建立的预缓存会话记在它名下，结束会话时只结束自己的：先 finish 旧 DetailActivity 再启动新页面时，
+     * 旧页面晚到的销毁不会结束新页面的会话。必须是普通 Object，不能是匿名类或 lambda（会捕获页面）。
+     */
+    private final Object precacheOwner = new Object();
     private String sourceKey;
     private SourceBean sourceBean;
 
