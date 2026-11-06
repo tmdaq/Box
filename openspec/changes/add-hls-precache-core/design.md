@@ -351,11 +351,15 @@ final class OkHttpSegmentDownloader implements SegmentDownloader {
 - **锁的顺序**，只允许下面这几种嵌套：
   - `HlsPrecache` 的锁 → `PrecacheSession` 的锁
   - `PrecacheSession` → `SegmentStore`
-  - `PrecacheSession` → `SegmentDownload`
   - `SegmentDownload` → `SegmentStore`
 
   `SegmentDownload` 结束时回调 `PrecacheSession.onFinished`，这个回调必须在释放自己的锁之后再调，避免反向加锁。
-- 主线程上的调用（`rewrite`、`endSession`）只做内存操作、`Call.cancel()` 和 `ioExecutor.execute()`。
+- **持会话锁和 `SegmentStore` 的锁时只做内存操作**（dev-test 返工时收紧）：
+  - 会话锁里不做任何磁盘 IO：命中查找（`committedFile` 的 stat、打开 `FileInputStream`）在锁外做；淘汰时在锁里只用 `SegmentStore.detach(key)` 摘掉记录（占用字节随即减少，`fits()` 立刻看得到），文件在释放会话锁之后由同一个线程删除。
+  - 会话锁里也不调 `SegmentDownload.cancel()`，不拿 `SegmentDownload` 的锁：要取消的下载在锁里记下来，释放锁之后再取消；会话在锁里读的 `contentLength`、`state`、`isThrottleSignal` 是 volatile 字段，不加锁读（写仍然在 `SegmentDownload` 的锁里）。原因是 `SegmentDownload` 持自己的锁时会做 rename 和打开读者（D7 要求它们和状态变化在同一把锁里）。
+  - `SegmentStore` 的 stat、rename、删除也都在它自己的锁外，锁里只改记录。
+  - 文件刚被摘掉记录、还没删时，同一个 key 又被重新下载并提交，这个新文件可能被随后的删除删掉。之后的请求按「文件被外部删除」处理（D6），重新回源，不会出错。被淘汰的分片在窗口外，这种情况只在播放器恰好请求它时才会出现。
+- 主线程上的调用（`rewrite`、`endSession`）因此不会在会话锁上等 IO：`close()` 在会话锁里只置 `closed` 并取下载列表的快照，然后在锁外逐个 `cancel()`。`cancel()` 最多等这个下载正在做的一次 rename 或打开读者（单次元数据操作），不会等文件删除。其余只有 `Call.cancel()` 和 `ioExecutor.execute()`。
 - 单个文件的删除只发生在 NanoHTTPD 线程或下载线程上。
 
 ### D6 磁盘布局（`SegmentStore`）
@@ -366,7 +370,7 @@ final class OkHttpSegmentDownloader implements SegmentDownloader {
 - **文件命名**：
   - 已提交的分片：`<key>.seg`。
   - 下载中的临时文件：`<key>.<下载序号>.tmp`。下载序号在进程内递增，保证两次下载不会写同一个临时文件。
-- **内存记录**：只有已提交的分片记在内存里，`key → (size, contentType)`，再加上 `committedBytes`。所有方法用 `synchronized` 保护。
+- **内存记录**：只有已提交的分片记在内存里，`key → (size, contentType)`，再加上 `committedBytes`。记录用 `synchronized` 保护，文件 IO（stat、rename、删除）都在锁外（D5）。
 
 ```java
 final class SegmentStore {
@@ -448,10 +452,13 @@ final class PrecacheSession implements SegmentDownload.Listener {
 **`open(index)` 的流程**：
 
 1. 会话已关闭 → 410。
-2. 加锁调用 `onRequest(index)`，更新锚点、处理跳转、淘汰、`pump()`，见 D9。
+2. 加锁调用 `onRequest(index)`，更新锚点、处理跳转、淘汰，见 D9。要取消的下载和要删的文件在释放锁之后处理（D5）。
 3. 会话已降级 → 纯转发，见下文。
-4. `store.committedFile(key)` 不为 null → 返回 200，body 是 `FileInputStream`，`length` 是文件长度，Content-Type 取存储的值。打开失败时按 D6 处理：文件已不存在按未命中，继续第 5 步；文件还在则降级，走纯转发。
-5. 找这个序号上正在进行的下载。没有，或者已经是终态 → 新建一个**按需下载**（`prefetch=false`），提交给 `downloadExecutor`。按需下载不检查并发上限和磁盘上限，但计入正在进行的下载数。如果这个序号在预缓存失败名单里，把它移出名单。
+4. **在锁外**调 `store.committedFile(key)`，不为 null → 返回 200，body 是 `FileInputStream`，`length` 是文件长度，Content-Type 取存储的值。打开失败时按 D6 处理：文件已不存在按未命中，继续第 5 步；文件还在则降级，走纯转发。
+5. 加锁，找这个序号上正在进行的下载，然后 `pump()`。
+   - 还在下载（`PENDING`、`STREAMING`），或者已经 `COMPLETED`（刚提交、还没从列表里移除）→ 加入它，不重复下载。
+   - 没有，或者已经以失败、取消结束：如果这时 store 里已经有这个分片（第 4 步查完、拿到锁之前刚提交并结束），回到第 4 步再查一次（只回一次）；否则新建一个**按需下载**（`prefetch=false`），提交给 `downloadExecutor`。按需下载不检查并发上限和磁盘上限，但计入正在进行的下载数。如果这个序号在预缓存失败名单里，把它移出名单。
+   - `downloadExecutor.execute()` 抛异常（如 `RejectedExecutionException`）时，这个下载移出列表并标成 `FAILED`，预缓存的序号记入失败名单，不会留下永远 `PENDING` 的下载。
 6. `awaitHeaders()` 之后按状态返回：
 
 | 状态 | 返回 |
@@ -512,7 +519,7 @@ final class PrecacheWindow {
 - **`onRequest(index)` 的处理**：
   1. 用 `isJump(anchor, index)` 判断是否跳转，然后设 `anchor = index`。
   2. 如果是跳转，取消所有序号不在 `[anchor, aheadEnd]` 里的**预缓存**下载。按需下载不取消，它有读者在等。
-  3. 每次锚点变化都淘汰一遍：删除已提交、但序号不在 `[behindStart, aheadEnd]` 里的分片，以及不属于当前列表的 key（同一地址复用时，列表内容可能变了）。这一步在 NanoHTTPD 线程上同步删除文件。
+  3. 每次锚点变化都淘汰一遍：删除已提交、但序号不在 `[behindStart, aheadEnd]` 里的分片，以及不属于当前列表的 key（同一地址复用时，列表内容可能变了）。持会话锁时只摘掉记录，文件在释放会话锁之后由 NanoHTTPD 线程同步删除（D5）。
   4. 调用 `pump()`。
 - **暂停**：暂停时播放器不再请求新分片，锚点不变。`pump()` 填满 `[anchor+1, aheadEnd]` 之后自然停止。不需要专门处理。
 - **会话刚开始还没有锚点时，不做预缓存**：续播会让第一个请求落在中间某个分片上，如果一开始就从第 0 片开始预取，下载的东西就浪费了。代价是第一个分片一定未命中，由按需下载边下边返回。
@@ -572,6 +579,11 @@ rewrite(url, content, headers, port):
     return playlist.render(prefix(port, id))
 
 endSession(): old = current; current = null; if (old != null) { old.close(); ioExecutor.execute(old.store()::deleteAll); }
+
+rewrite(url, content, headers, port, owner): 同 4 参版，新会话建好时在门面锁里记下 currentOwner = owner；4 参版即 owner = null。
+                                            不适用或抛异常时同 4 参版：无条件结束上一个会话，返回 null。
+endSession(owner): owner == null → 什么都不做；持门面锁比较 currentOwner == owner（同一个对象），
+                   不相等什么都不做，相等时和 endSession() 一样结束。current 被摘下时 currentOwner 一起清空。
 
 openSegment(sid, idx): 校验参数（400）→ s = current（volatile 读，不持门面锁）→ s == null 或 !s.id().equals(sid) → 410
                        → idx >= s.segmentCount() → 404 → s.open(idx)；捕获 Throwable → 500

@@ -23,6 +23,7 @@ import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -200,7 +201,118 @@ public class HlsPrecacheTest {
         assertEquals(0, origin.totalRequests());
     }
 
+    // ---- 按 owner 结束会话 ----
+
+    /** 会话还有效时，越界的序号是 404；会话已结束是 410。都不请求源站。 */
+    private boolean isLive(String id) {
+        int status = precache.openSegment(id, "3").status;
+        assertTrue(String.valueOf(status), status == 404 || status == 410);
+        return status == 404;
+    }
+
+    @Test
+    public void endSessionOfAnEarlierOwnerDoesNotEndTheNewerOwnersSession() {
+        Object pageA = new Object();
+        Object pageB = new Object();
+        precache.rewrite(URL_A, M3U8, null, 9978, pageA);
+        String b = sessionId(precache.rewrite(URL_B, M3U8, null, 9978, pageB));
+
+        // 旧页面的 onDestroy 晚于新页面的 rewrite 到达
+        precache.endSession(pageA);
+        assertTrue("B's session survives A's endSession", isLive(b));
+
+        precache.endSession(pageB);
+        assertFalse("B ends its own session", isLive(b));
+        assertEquals(0, origin.totalRequests());
+    }
+
+    @Test
+    public void endSessionWithNullOwnerDoesNothing() {
+        String owned = sessionId(precache.rewrite(URL_A, M3U8, null, 9978, new Object()));
+        precache.endSession(null);
+        assertTrue(isLive(owned));
+
+        String unowned = sessionId(rewrite(URL_B));
+        precache.endSession(null);
+        assertTrue("a session without owner is not ended by endSession(null)", isLive(unowned));
+    }
+
+    @Test
+    public void endSessionWithAnOwnerDoesNotEndASessionWithoutOwner() {
+        String unowned = sessionId(rewrite(URL_A));
+
+        precache.endSession(new Object());
+
+        assertTrue(isLive(unowned));
+    }
+
+    @Test
+    public void endSessionWithoutOwnerStillEndsAnOwnedSession() {
+        String owned = sessionId(precache.rewrite(URL_A, M3U8, null, 9978, new Object()));
+
+        precache.endSession();
+
+        assertFalse(isLive(owned));
+    }
+
+    @Test
+    public void notApplicableRewriteWithOwnerEndsThePreviousSession() {
+        Object page = new Object();
+        String id = sessionId(precache.rewrite(URL_A, M3U8, null, 9978, page));
+
+        assertNull(precache.rewrite(URL_A, "#EXTM3U\n#EXTINF:10,\nseg0.ts\n", null, 9978, new Object()));
+
+        assertFalse(isLive(id));
+    }
+
     // ---- 会话复用与清空 ----
+
+    @Test
+    public void rewritingAnotherPlaylistCancelsDownloadsOfThePreviousSession() throws Exception {
+        assertPreviousDownloadsCancelledBy(() -> rewrite(URL_B));
+    }
+
+    @Test
+    public void rewritingTheSamePlaylistCancelsDownloadsOfThePreviousSession() throws Exception {
+        assertPreviousDownloadsCancelledBy(() -> rewrite(URL_A));
+    }
+
+    @Test
+    public void endSessionCancelsDownloadsOfTheSession() throws Exception {
+        assertPreviousDownloadsCancelledBy(() -> precache.endSession());
+    }
+
+    /** 会话 A 有 3 个下载卡在 body 上（播放器的 seg0 和预缓存的 seg1、seg2），执行 action 后它们都要被取消。 */
+    private void assertPreviousDownloadsCancelledBy(Runnable action) throws Exception {
+        CountDownLatch gate = new CountDownLatch(1);
+        origin.holdDefaultBody(10, gate);
+        try {
+            String id = sessionId(rewrite(URL_A));
+            SegmentResponse first = precache.openSegment(id, "0");
+            assertEquals(200, first.status);
+            String[] segs = {"https://cdn.example.com/a/seg0.ts", "https://cdn.example.com/a/seg1.ts",
+                    "https://cdn.example.com/a/seg2.ts"};
+            awaitRequested(segs);
+
+            action.run();
+
+            for (String seg : segs) assertTrue(seg + " cancelled", origin.wasCancelled(seg));
+            first.close();
+        } finally {
+            gate.countDown();
+        }
+    }
+
+    /** 等到这些地址都已发出请求：下载已经建好 Call，之后的 cancel 一定会落到 Call 上。 */
+    private void awaitRequested(String... urls) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5000;
+        for (String url : urls) {
+            while (origin.requestCount(url) == 0) {
+                if (System.currentTimeMillis() > deadline) throw new AssertionError(url + " was not requested");
+                Thread.sleep(10);
+            }
+        }
+    }
 
     @Test
     public void samePlaylistUrlReusesDownloadedSegmentsAndKeepsDirectory() throws Exception {

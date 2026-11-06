@@ -25,12 +25,16 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class PrecacheSessionTest {
 
@@ -145,6 +149,11 @@ public class PrecacheSessionTest {
         }
     }
 
+    /** 等到这些分片都已向源站发出请求：下载已经建好 Call，之后的 cancel 一定会落到 Call 上。 */
+    private void awaitRequested(int... indexes) throws InterruptedException {
+        for (int i : indexes) eventually("seg" + i + " requested", () -> origin.requestCount(url(i)) == 1);
+    }
+
     /** 等到所有下载都已跑完（包括 onFinished 里的 pump）。 */
     private void awaitIdle() throws InterruptedException {
         eventually("idle", () -> running.get() == 0);
@@ -226,11 +235,56 @@ public class PrecacheSessionTest {
         play(0);
         eventually("seg1 prefetch started", () -> origin.requestCount(url(1)) == 1);
 
-        Future<byte[]> seg1 = pool.submit(() -> play(1));
+        // 预缓存卡在第 10 个字节上，不可能已经提交：播放器只能跟读这次下载，先拿到前 10 个字节，再放行
+        Future<SegmentResponse> seg1 = pool.submit(() -> session.open(1));
+        SegmentResponse r = seg1.get(5, TimeUnit.SECONDS);
+        assertEquals(200, r.status);
+        byte[] head = new byte[10];
+        int off = 0;
+        while (off < head.length) off += r.body.read(head, off, head.length - off);
         gate.countDown();
+        byte[] rest = readAll(r.body);
 
-        assertArrayEquals(bytes(1), seg1.get(5, TimeUnit.SECONDS));
+        ByteArrayOutputStream all = new ByteArrayOutputStream();
+        all.write(head);
+        all.write(rest);
+        assertArrayEquals(bytes(1), all.toByteArray());
         assertEquals(1, origin.requestCount(url(1)));
+    }
+
+    @Test
+    public void prefetchCompletingWhileThePlayerLooksItUpIsServedWithoutASecondRequest() throws Exception {
+        CountDownLatch gate = gate();
+        origin.on(url(1)).body(bytes(1)).holdBody(10, gate);
+        AtomicInteger lookups = new AtomicInteger();
+        // 播放器查磁盘时还没提交；查完、找到正在进行的下载之前，这个预缓存下载完成并提交
+        store = new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            File committedFile(String key) {
+                File file = super.committedFile(key);
+                if (key.equals(key(1)) && lookups.getAndIncrement() == 0) {
+                    gate.countDown();
+                    awaitQuietly(() -> isCommitted(key(1)));
+                }
+                return file;
+            }
+        };
+        newSession(5);
+        play(0);
+        eventually("seg1 prefetch started", () -> origin.requestCount(url(1)) == 1);
+
+        assertArrayEquals(bytes(1), play(1));
+
+        assertEquals("served from the prefetch, not a new download", 1, origin.requestCount(url(1)));
+    }
+
+    /** 在钩子里等条件成立；超时由调用它的测试的断言暴露。 */
+    private static void awaitQuietly(Condition condition) {
+        try {
+            eventually("hook condition", condition);
+        } catch (InterruptedException | AssertionError ignored) {
+            // 钩子不抛异常
+        }
     }
 
     @Test
@@ -242,6 +296,26 @@ public class PrecacheSessionTest {
 
         assertArrayEquals(bytes(0), play(0));
         assertEquals(2, origin.requestCount(url(0)));
+    }
+
+    @Test
+    public void rejectedDownloadDoesNotLeaveLaterRequestsWaitingForever() throws Exception {
+        AtomicInteger rejections = new AtomicInteger(1);
+        Executor rejectsFirst = r -> {
+            if (rejections.getAndDecrement() > 0) throw new RejectedExecutionException("pool is full");
+            executor.execute(r);
+        };
+        session = new PrecacheSession("abc", playlist(5), null, store, config(3, Long.MAX_VALUE), origin, rejectsFirst);
+
+        Future<SegmentResponse> first = pool.submit(() -> session.open(0));
+        try {
+            first.get(5, TimeUnit.SECONDS).close();
+        } catch (ExecutionException ignored) {
+            // 第一次请求怎么失败都可以，只要不卡住
+        }
+        Future<byte[]> again = pool.submit(() -> play(0));
+
+        assertArrayEquals(bytes(0), again.get(5, TimeUnit.SECONDS));
     }
 
     // ---- 源站错误 ----
@@ -306,6 +380,57 @@ public class PrecacheSessionTest {
         assertTrue(store.committedKeys().isEmpty());
     }
 
+    @Test
+    public void writeFailureOfAPrefetchDegradesToPureForwarding() throws Exception {
+        store = failingStore(key(1), false);
+        assertDegradesAfterPrefetchOfSegment1Fails();
+    }
+
+    @Test
+    public void commitFailureOfAPrefetchDegradesToPureForwarding() throws Exception {
+        store = failingStore(key(1), true);
+        assertDegradesAfterPrefetchOfSegment1Fails();
+    }
+
+    /**
+     * 只有 failingKey 的分片写盘失败：临时文件是个目录，打开写入流就失败；或者 rename 提交失败。
+     * 其余分片正常读写。
+     */
+    private SegmentStore failingStore(String failingKey, boolean failCommit) {
+        return new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            File newTempFile(String key) throws IOException {
+                if (failCommit || !key.equals(failingKey)) return super.newTempFile(key);
+                File dir = new File(tmp.getRoot(), "temp-is-a-directory");
+                assertTrue(dir.mkdirs() || dir.isDirectory());
+                return dir;
+            }
+
+            @Override
+            void commit(String key, File temp, long size, String contentType) throws IOException {
+                if (failCommit && key.equals(failingKey)) throw new IOException("rename failed");
+                super.commit(key, temp, size, contentType);
+            }
+        };
+    }
+
+    private void assertDegradesAfterPrefetchOfSegment1Fails() throws Exception {
+        newSession(20);
+        assertArrayEquals(bytes(0), play(0));
+        awaitIdle();
+        assertEquals("prefetch of seg1 was attempted", 1, origin.requestCount(url(1)));
+        int before = submitted.get();
+
+        // seg15 在第 0 片的窗口之外，降级前不可能被预缓存
+        assertArrayEquals(bytes(15), play(15));
+        assertArrayEquals(bytes(0), play(0));
+
+        assertEquals("no download is scheduled after degrading", before, submitted.get());
+        assertEquals("forwarded to origin", 1, origin.requestCount(url(15)));
+        assertFalse("forwarding does not write to disk", store.isCommitted(key(15)));
+        assertEquals("committed segments are not read any more", 2, origin.requestCount(url(0)));
+    }
+
     private int statusAfterPlan(int index, int code) {
         origin.on(url(index)).code(code);
         return session.open(index).status;
@@ -351,10 +476,16 @@ public class PrecacheSessionTest {
     }
 
     @Test
-    public void noPrefetchBeforeFirstRequest() {
+    public void prefetchStartsOnlyAfterTheFirstRequest() throws Exception {
         newSession(40);
 
-        assertEquals(0, submitted.get());
+        assertEquals("no prefetch before the first request", 0, submitted.get());
+        assertEquals(0, origin.totalRequests());
+
+        play(5);
+        // 对照：请求过第一个分片之后，从它的下一个分片开始预取
+        eventually("prefetch after the first request", () -> origin.requestCount(url(6)) == 1);
+        assertEquals("prefetch does not start from segment 0", 0, origin.requestCount(url(0)));
     }
 
     @Test
@@ -377,7 +508,7 @@ public class PrecacheSessionTest {
         origin.holdDefaultBody(10, gate);
         newSession(100);
         SegmentResponse first = session.open(0);
-        eventually("prefetch started", () -> origin.requestCount(url(2)) == 1);
+        awaitRequested(0, 1, 2);
 
         SegmentResponse jumped = session.open(50);
 
@@ -388,6 +519,32 @@ public class PrecacheSessionTest {
         gate.countDown();
         assertArrayEquals(bytes(0), readAll(first.body));
         assertArrayEquals(bytes(50), readAll(jumped.body));
+    }
+
+    @Test
+    public void playerWaitingOnAPrefetchCancelledByAJumpRetriesAsAMiss() throws Exception {
+        CountDownLatch headers = gate();
+        origin.on(url(1)).body(bytes(1)).holdHeaders(headers);
+        newSession(100);
+        play(0);
+        awaitRequested(1);
+        AtomicReference<Thread> player = new AtomicReference<>();
+        Future<SegmentResponse> seg1 = pool.submit(() -> {
+            player.set(Thread.currentThread());
+            return session.open(1);
+        });
+        // 播放器在等 seg1 这个预缓存下载的响应头（awaitHeaders 里的 wait()）
+        eventually("player waits for the prefetch", () -> player.get() != null
+                && player.get().getState() == Thread.State.WAITING);
+
+        assertArrayEquals(bytes(50), play(50));
+        assertTrue("the jump cancels the prefetch the player waits for", origin.wasCancelled(url(1)));
+        headers.countDown();
+
+        SegmentResponse r = seg1.get(5, TimeUnit.SECONDS);
+        assertEquals(200, r.status);
+        assertArrayEquals(bytes(1), readAll(r.body));
+        assertEquals("retried once as a miss", 2, origin.requestCount(url(1)));
     }
 
     @Test
@@ -417,6 +574,69 @@ public class PrecacheSessionTest {
         assertFalse(store.isCommitted("stale"));
     }
 
+    // ---- 持会话锁时不做 IO（D5） ----
+
+    @Test
+    public void closeDoesNotWaitForAFileDeletionOfAnotherRequest() throws Exception {
+        CountDownLatch deleting = new CountDownLatch(1);
+        CountDownLatch release = gate();
+        store = new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            void delete(File file) {
+                deleting.countDown();
+                awaitQuietly(() -> release.getCount() == 0);
+                super.delete(file);
+            }
+        };
+        newSession(100);
+        play(0);
+        awaitIdle();
+
+        // 跳转要删除旧窗口里的分片，删除卡住
+        Future<SegmentResponse> jump = pool.submit(() -> session.open(50));
+        assertTrue(deleting.await(5, TimeUnit.SECONDS));
+
+        assertClosesPromptly();
+        release.countDown();
+        jump.get(5, TimeUnit.SECONDS).close();
+    }
+
+    @Test
+    public void closeDoesNotWaitForADiskLookupOfAnotherRequest() throws Exception {
+        CountDownLatch lookingUp = new CountDownLatch(1);
+        CountDownLatch release = gate();
+        AtomicBoolean armed = new AtomicBoolean();
+        store = new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            File committedFile(String key) {
+                if (armed.getAndSet(false)) {
+                    lookingUp.countDown();
+                    awaitQuietly(() -> release.getCount() == 0);
+                }
+                return super.committedFile(key);
+            }
+        };
+        newSession(100);
+        play(0);
+        awaitIdle();
+        armed.set(true);
+
+        // 命中查找（stat、打开文件）卡住
+        Future<SegmentResponse> hit = pool.submit(() -> session.open(1));
+        assertTrue(lookingUp.await(5, TimeUnit.SECONDS));
+
+        assertClosesPromptly();
+        release.countDown();
+        hit.get(5, TimeUnit.SECONDS).close();
+    }
+
+    /** rewrite、endSession 在主线程上调用 close()，它不能等别的线程正在做的磁盘 IO。 */
+    private void assertClosesPromptly() throws Exception {
+        Future<?> close = pool.submit(session::close);
+        close.get(2, TimeUnit.SECONDS);
+        assertEquals(410, session.open(2).status);
+    }
+
     // ---- 磁盘上限 ----
 
     @Test
@@ -433,25 +653,48 @@ public class PrecacheSessionTest {
         assertEquals(0, origin.requestCount(url(4)));
     }
 
+    @Test
+    public void playerMissIsDownloadedAndCachedEvenOverTheCap() throws Exception {
+        // 上限比一个分片还小：预缓存一个都放不下
+        newSession(40, config(3, 50));
+
+        assertArrayEquals(bytes(0), play(0));
+        awaitIdle();
+        assertEquals("a player miss is still written to disk", keys(0, 0), store.committedKeys());
+
+        // 已经超出上限，再来一个未命中照样回源、写盘（seg0 作为回看分片被淘汰，给上限腾地方）
+        assertArrayEquals(bytes(1), play(1));
+        awaitIdle();
+        assertTrue(store.isCommitted(key(1)));
+        assertEquals(1, origin.requestCount(url(1)));
+        assertEquals("no prefetch over the cap", 0, origin.requestCount(url(2)));
+    }
+
     // ---- 限流 ----
 
     @Test
     public void threeThrottleSignalsDropConcurrencyToOneForGood() throws Exception {
-        CountDownLatch gate = gate();
-        origin.on(url(0)).body(bytes(0)).holdBody(10, gate);
+        CountDownLatch playerGate = gate();
+        CountDownLatch prefetchGate = gate();
+        origin.on(url(0)).body(bytes(0)).holdBody(10, playerGate);
         origin.on(url(1)).code(429);
         origin.on(url(2)).code(503);
         origin.on(url(3)).error(new ConnectException("refused"));
+        // 其余分片都卡在 body 上，结束的只有 3 个限流信号，信号到达的先后不影响结果
+        origin.holdDefaultBody(10, prefetchGate);
         newSession(40);
 
         SegmentResponse first = session.open(0);
-        // 第 3 个信号之前最多再开始 seg4；之后只剩被卡住的播放器下载，它独占唯一的并发名额
-        eventually("only the held player download is left",
-                () -> origin.requestCount(url(3)) == 1 && running.get() == 1);
-        assertEquals("throttled before the window fills", 0, origin.requestCount(url(6)));
+        // 前两个信号各空出一个名额，补上 seg3、seg4；第 3 个信号之后降到 1 个，不再补。
+        // running 在 seg1–3 都跑完之前一直是 3，所以等到 2 就说明 3 个信号都已到达。
+        eventually("three throttle signals arrived", () -> running.get() == 2);
+        assertEquals(1, origin.requestCount(url(4)));
+        assertEquals("throttled before the window fills", 0, origin.requestCount(url(5)));
 
+        prefetchGate.countDown();
+        eventually("seg4 committed", () -> store.isCommitted(key(4)));
         origin.resetMaxInFlight();
-        gate.countDown();
+        playerGate.countDown();
         readAll(first.body);
         awaitIdle();
         assertEquals(1, origin.maxInFlight());
@@ -472,7 +715,7 @@ public class PrecacheSessionTest {
         origin.holdDefaultBody(10, gate);
         newSession(40);
         SegmentResponse first = session.open(0);
-        eventually("prefetch started", () -> origin.requestCount(url(2)) == 1);
+        awaitRequested(0, 1, 2);
 
         session.close();
         session.close();

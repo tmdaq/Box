@@ -32,15 +32,16 @@ final class SegmentDownload implements Runnable {
     private final SegmentStore store;
     private final Listener listener;
 
-    // 以下字段由本对象的锁保护
-    private State state = State.PENDING;
+    // 以下字段只在本对象的锁里写。volatile 的几个可以不加锁读：会话持自己的锁时会读它们，
+    // 不能去等本对象的锁，因为本对象持锁时会做 rename 和打开文件（design.md D5）。
+    private volatile State state = State.PENDING;
     private SegmentDownloader.Call call;
     private File temp;
     private long bytesWritten;
-    private int httpCode;
-    private long contentLength = -1;
-    private String contentType;
-    private boolean throttleSignal;
+    private volatile int httpCode;
+    private volatile long contentLength = -1;
+    private volatile String contentType;
+    private volatile boolean throttleSignal;
 
     SegmentDownload(HlsSegment seg, Map<String, String> headers, boolean prefetch,
                     SegmentDownloader downloader, SegmentStore store, Listener listener) {
@@ -137,7 +138,10 @@ final class SegmentDownload implements Runnable {
         return commit(file);
     }
 
-    /** 提交和改为 COMPLETED 在同一个锁里完成；已取消的下载一定不会提交。 */
+    /**
+     * 提交和改为 COMPLETED 在同一个锁里完成：读者和 cancel() 要么看到还没提交的 STREAMING，
+     * 要么看到已经提交的 COMPLETED。已取消的下载一定不会提交。
+     */
     private synchronized State commit(File file) {
         if (state == State.CANCELLED) return State.CANCELLED;
         if (contentLength >= 0 && bytesWritten != contentLength) return State.FAILED;
@@ -147,12 +151,14 @@ final class SegmentDownload implements Runnable {
             return State.DISK_ERROR;
         }
         temp = null;
+        state = State.COMPLETED;
+        notifyAll();
         return State.COMPLETED;
     }
 
-    /** 进入终态；已经被取消的保持 CANCELLED。 */
+    /** 进入终态；已经是终态的（被取消，或者已提交）保持不变。 */
     private synchronized void finish(State terminal, boolean throttle) {
-        if (state == State.CANCELLED) return;
+        if (isFinished()) return;
         state = terminal;
         throttleSignal = throttle;
         notifyAll();
@@ -200,27 +206,32 @@ final class SegmentDownload implements Runnable {
         return new Reader(new FileInputStream(temp));
     }
 
-    /** 不阻塞。 */
-    synchronized State state() {
+    /** 执行器没能运行这次下载时调用：进入 FAILED，等响应头的读者随即返回。 */
+    void notStarted() {
+        finish(State.FAILED, false);
+    }
+
+    /** 以下读取都不加锁、不阻塞。 */
+    State state() {
         return state;
     }
 
-    synchronized int httpCode() {
+    int httpCode() {
         return httpCode;
     }
 
     /** -1 表示未知。 */
-    synchronized long contentLength() {
+    long contentLength() {
         return contentLength;
     }
 
     /** 源站的 Content-Type，可能为 null。 */
-    synchronized String contentType() {
+    String contentType() {
         return contentType;
     }
 
     /** 结果是 403/429/503 或连接被拒时为 true。 */
-    synchronized boolean isThrottleSignal() {
+    boolean isThrottleSignal() {
         return throttleSignal;
     }
 
@@ -228,8 +239,18 @@ final class SegmentDownload implements Runnable {
         return prefetch;
     }
 
-    synchronized boolean isFinished() {
-        return state != State.PENDING && state != State.STREAMING;
+    boolean isFinished() {
+        return isFinished(state);
+    }
+
+    /** 还在下载，或者已经提交：新来的读者可以等它或者直接读它，不需要再下载一次。 */
+    boolean canServe() {
+        State s = state;
+        return !isFinished(s) || s == State.COMPLETED;
+    }
+
+    private static boolean isFinished(State s) {
+        return s != State.PENDING && s != State.STREAMING;
     }
 
     /** 任意线程，不阻塞。取消后不会提交，读者抛 IOException。 */
