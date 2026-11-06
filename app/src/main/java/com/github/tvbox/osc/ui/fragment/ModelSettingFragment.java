@@ -77,6 +77,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
     private TextView tvScale;
     private TextView tvPlay;
     private TextView tvVideoPurifyText;
+    private TextView tvHlsPrecacheText;
 
     // System Section
     private TextView tvLocale;
@@ -126,6 +127,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
         tvPlay.setText(PlayerHelper.getPlayerName(Hawk.get(HawkConfig.PLAY_TYPE, 0)));
         tvVideoPurifyText = findViewById(R.id.tvVideoPurifyText);
         tvVideoPurifyText.setText(Hawk.get(HawkConfig.VIDEO_PURIFY, true) ? "开启" : "关闭");
+        tvHlsPrecacheText = findViewById(R.id.tvHlsPrecacheText);
+        tvHlsPrecacheText.setText(Hawk.get(HawkConfig.HLS_PRECACHE, false) ? "开启" : "关闭");
         // System Section
         tvLocale = findViewById(R.id.tvLocale);
         tvLocale.setText(getLocaleView(Hawk.get(HawkConfig.HOME_LOCALE, 0)));
@@ -500,6 +503,13 @@ public class ModelSettingFragment extends BaseLazyFragment {
             FastClickCheckUtil.check(v);
             Hawk.put(HawkConfig.VIDEO_PURIFY, !Hawk.get(HawkConfig.VIDEO_PURIFY, true));
             tvVideoPurifyText.setText(Hawk.get(HawkConfig.VIDEO_PURIFY, true) ? "开启" : "关闭");
+        });
+
+        // toggle hls precache -------------------------------------
+        findViewById(R.id.llHlsPrecache).setOnClickListener(v -> {
+            FastClickCheckUtil.check(v);
+            Hawk.put(HawkConfig.HLS_PRECACHE, !Hawk.get(HawkConfig.HLS_PRECACHE, false));
+            tvHlsPrecacheText.setText(Hawk.get(HawkConfig.HLS_PRECACHE, false) ? "开启" : "关闭");
         });
 
         // 3. SYSTEM Configuration -------------------------------------------------------------- //
