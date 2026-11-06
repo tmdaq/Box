@@ -59,20 +59,31 @@ public final class M3u8PlayPlanner {
 
     /**
      * 拿到最终要播的那份 m3u8 后，决定交给播放器什么。不做 IO（purifier / rewriter 由调用方注入）。
-     * @param playlistUrl 这份 m3u8 的真实地址：没跟随时是 url，跟随过时是 finalforwardurl
+     * @param playlistUrl 请求这份 m3u8 时的地址：没跟随时是 url，跟随过时是 finalforwardurl。
+     *                    去广告的目录前缀和不改写时交给播放器的地址都用它，和未开启预缓存时一致。
+     * @param finalUrl    跟随重定向之后的最终地址（{@link #finalUrl}），只交给 rewriter，用来解析相对分片地址。
      * @param port        RemoteServer.serverPort
      */
-    public static Plan plan(String playlistUrl, String content, Map<String, String> headers,
+    public static Plan plan(String playlistUrl, String finalUrl, String content, Map<String, String> headers,
                             boolean purify, boolean precache, int port,
                             Purifier purifier, Rewriter rewriter) {
         String local = "http://127.0.0.1:" + port + "/m3u8";
         String purified = purify ? purifier.purify(directoryOf(playlistUrl), content) : null;
         if (precache) {
-            String rewritten = rewriter.rewrite(playlistUrl, purified != null ? purified : content, headers, port);
+            String rewritten = rewriter.rewrite(finalUrl, purified != null ? purified : content, headers, port);
             if (rewritten != null) return new Plan(local, true, rewritten, true);
         }
         if (purify) return new Plan(purified != null ? local : playlistUrl, true, purified, false);
         return new Plan(playlistUrl, false, null, false);
+    }
+
+    /**
+     * OkGo 的全局 client 会跟随重定向，raw.request() 是最后一次请求，它的地址才是 m3u8 的真实源站地址。
+     * @param raw          OkGo 回调里的 response.getRawResponse()，可以为 null（如命中缓存）
+     * @param requestedUrl 发起请求时的地址，raw 为 null 时原样返回
+     */
+    public static String finalUrl(okhttp3.Response raw, String requestedUrl) {
+        return raw != null ? raw.request().url().toString() : requestedUrl;
     }
 
     /** 地址最后一个 '/' 及之前的部分，用来解析列表里的相对分片地址。 */

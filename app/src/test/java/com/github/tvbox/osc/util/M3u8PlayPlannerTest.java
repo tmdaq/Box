@@ -30,6 +30,9 @@ public class M3u8PlayPlannerTest {
         assertFalse(M3u8PlayPlanner.shouldFetch(URL, false, false));
         assertFalse(M3u8PlayPlanner.shouldFetch("http://127.0.0.1/proxy?x=1", false, false));
         assertFalse(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.mp4", false, false));
+        // 对照：只打开去广告，同样的地址就要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch(URL, true, false));
+        assertTrue(M3u8PlayPlanner.shouldFetch("http://127.0.0.1/proxy?x=1", true, false));
     }
 
     @Test
@@ -46,11 +49,15 @@ public class M3u8PlayPlannerTest {
     @Test
     public void shouldFetchIsFalseWhenPurifyOnAndUrlIsLocalProxyWithPort() {
         assertFalse(M3u8PlayPlanner.shouldFetch("http://127.0.0.1:9978/proxy?do=py", true, false));
+        // 对照：不带端口时要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch("http://127.0.0.1/proxy?do=py", true, false));
     }
 
     @Test
     public void shouldFetchIsFalseWhenPurifyOnAndUrlIsPlainDirectLink() {
         assertFalse(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.mp4", true, false));
+        // 对照：同一主机上的 m3u8 要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.m3u8", true, false));
     }
 
     // ---------- isPlaylist ----------
@@ -73,6 +80,9 @@ public class M3u8PlayPlannerTest {
     @Test
     public void findForwardUrlReturnsEmptyForMediaPlaylist() {
         assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, MEDIA));
+        // 对照：同一地址下只含一个子列表的主列表能找到子列表
+        assertEquals("https://cdn.a.com/path/720/index.m3u8",
+                M3u8PlayPlanner.findForwardUrl(URL, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720/index.m3u8\n"));
     }
 
     @Test
@@ -109,28 +119,41 @@ public class M3u8PlayPlannerTest {
     public void findForwardUrlReturnsEmptyWhenOnlyUriLineIsNotM3u8() {
         String content = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nvideo.mp4\n";
         assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, content));
+        // 对照：同一行换成 m3u8 就能找到
+        assertEquals("https://cdn.a.com/path/video.m3u8",
+                M3u8PlayPlanner.findForwardUrl(URL, content.replace("video.mp4", "video.m3u8")));
     }
 
     @Test
     public void findForwardUrlReturnsEmptyForMasterWithTwoSubPlaylists() {
-        String master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720/index.m3u8\n"
-                + "#EXT-X-STREAM-INF:BANDWIDTH=1600000\n1080/index.m3u8\n";
+        String single = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720/index.m3u8\n";
+        String master = single + "#EXT-X-STREAM-INF:BANDWIDTH=1600000\n1080/index.m3u8\n";
         assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, master));
+        // 对照：只有第一个子列表时能找到它
+        assertEquals("https://cdn.a.com/path/720/index.m3u8", M3u8PlayPlanner.findForwardUrl(URL, single));
     }
 
     @Test
     public void findForwardUrlOnlyLooksAtFirstTenLines() {
+        // 子列表在第 12 行：找不到
+        assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, masterWithSubPlaylistOnLine(12)));
+        // 对照：子列表在第 9 行：能找到
+        assertEquals("https://cdn.a.com/path/720/index.m3u8",
+                M3u8PlayPlanner.findForwardUrl(URL, masterWithSubPlaylistOnLine(9)));
+    }
+
+    /** 第 1 行 #EXTM3U，中间是注释行，子列表 720/index.m3u8 在第 line 行（从 1 数起）。 */
+    private static String masterWithSubPlaylistOnLine(int line) {
         StringBuilder master = new StringBuilder("#EXTM3U\n");
-        for (int i = 0; i < 10; i++) master.append("#EXT-X-COMMENT:").append(i).append('\n');
-        master.append("720/index.m3u8\n");
-        assertEquals("", M3u8PlayPlanner.findForwardUrl(URL, master.toString()));
+        for (int i = 2; i < line; i++) master.append("#EXT-X-COMMENT:").append(i).append('\n');
+        return master.append("720/index.m3u8\n").toString();
     }
 
     // ---------- plan（precache=false） ----------
 
     @Test
     public void planPlaysLocalM3u8WhenPurifySucceeds() {
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, false, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, true, false, PORT,
                 fixedPurifier("PURIFIED"), forbiddenRewriter());
 
         assertEquals(LOCAL, p.playUrl);
@@ -141,7 +164,7 @@ public class M3u8PlayPlannerTest {
 
     @Test
     public void planPlaysPlaylistUrlAndStoresNullWhenPurifyReturnsNull() {
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, false, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, true, false, PORT,
                 fixedPurifier(null), forbiddenRewriter());
 
         assertEquals(URL, p.playUrl);
@@ -154,7 +177,8 @@ public class M3u8PlayPlannerTest {
     public void planPassesPlaylistDirectoryAndContentToPurifier() {
         RecordingPurifier purifier = new RecordingPurifier("PURIFIED");
 
-        M3u8PlayPlanner.plan("https://cdn.a.com/hls/720/index.m3u8?sign=a/b", MEDIA, null, true, false, PORT,
+        String playlistUrl = "https://cdn.a.com/hls/720/index.m3u8?sign=a/b";
+        M3u8PlayPlanner.plan(playlistUrl, playlistUrl, MEDIA, null, true, false, PORT,
                 purifier, forbiddenRewriter());
 
         assertEquals("https://cdn.a.com/hls/720/index.m3u8?sign=a/", purifier.tsUrlPre);
@@ -163,7 +187,7 @@ public class M3u8PlayPlannerTest {
 
     @Test
     public void planBuildsLocalUrlFromPort() {
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, false, 9981,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, true, false, 9981,
                 fixedPurifier("PURIFIED"), forbiddenRewriter());
 
         assertEquals("http://127.0.0.1:9981/m3u8", p.playUrl);
@@ -171,7 +195,7 @@ public class M3u8PlayPlannerTest {
 
     @Test
     public void planPlaysPlaylistUrlWithoutTouchingContentWhenNothingApplies() {
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, false, false, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, false, false, PORT,
                 forbiddenPurifier(), forbiddenRewriter());
 
         assertEquals(URL, p.playUrl);
@@ -192,6 +216,8 @@ public class M3u8PlayPlannerTest {
     public void shouldFetchIsFalseWhenOnlyPrecacheOnAndUrlIsPlainDirectLink() {
         assertFalse(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.mp4", false, true));
         assertFalse(M3u8PlayPlanner.shouldFetch("http://127.0.0.1:9978/proxy?do=py", false, true));
+        // 对照：只打开预缓存，m3u8 地址要拉取
+        assertTrue(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.m3u8", false, true));
     }
 
     // ---------- plan（precache=true） ----------
@@ -200,7 +226,7 @@ public class M3u8PlayPlannerTest {
     public void planRewritesPurifiedContentAndPlaysLocalM3u8() {
         RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
 
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, true, true, PORT,
                 fixedPurifier("PURIFIED"), rewriter);
 
         assertEquals("PURIFIED", rewriter.content);
@@ -214,7 +240,7 @@ public class M3u8PlayPlannerTest {
     public void planRewritesOriginalContentWhenPurifyFails() {
         RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
 
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, true, true, PORT,
                 fixedPurifier(null), rewriter);
 
         assertEquals(MEDIA, rewriter.content);
@@ -227,7 +253,7 @@ public class M3u8PlayPlannerTest {
     public void planRewritesOriginalContentWithoutPurifyingWhenPurifyOff() {
         RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
 
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, false, true, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, false, true, PORT,
                 forbiddenPurifier(), rewriter);
 
         assertEquals(MEDIA, rewriter.content);
@@ -243,7 +269,7 @@ public class M3u8PlayPlannerTest {
         Map<String, String> headers = new HashMap<>();
         headers.put("Referer", "https://site.c.com/");
 
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, headers, false, true, 9981,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, headers, false, true, 9981,
                 forbiddenPurifier(), rewriter);
 
         assertEquals(URL, rewriter.playlistUrl);
@@ -254,7 +280,7 @@ public class M3u8PlayPlannerTest {
 
     @Test
     public void planFallsBackToPurifiedLocalM3u8WhenRewriteNotApplicable() {
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, true, true, PORT,
                 fixedPurifier("PURIFIED"), new RecordingRewriter(null));
 
         assertEquals(LOCAL, p.playUrl);
@@ -265,7 +291,7 @@ public class M3u8PlayPlannerTest {
 
     @Test
     public void planFallsBackToPlaylistUrlWhenPurifyFailsAndRewriteNotApplicable() {
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, true, true, PORT,
                 fixedPurifier(null), new RecordingRewriter(null));
 
         assertEquals(URL, p.playUrl);
@@ -276,13 +302,68 @@ public class M3u8PlayPlannerTest {
 
     @Test
     public void planFallsBackToPlaylistUrlWhenPurifyOffAndRewriteNotApplicable() {
-        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, false, true, PORT,
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, URL, MEDIA, null, false, true, PORT,
                 forbiddenPurifier(), new RecordingRewriter(null));
 
         assertEquals(URL, p.playUrl);
         assertFalse(p.setM3u8Content);
         assertNull(p.m3u8Content);
         assertFalse(p.precached);
+    }
+
+    // ---------- 重定向：请求地址与最终地址不同 ----------
+
+    private static final String REDIRECTED = "https://edge.b.com/v/9/index.m3u8";
+
+    @Test
+    public void planRewritesAgainstRedirectedUrlButPurifiesAgainstRequestedDirectory() {
+        RecordingPurifier purifier = new RecordingPurifier("PURIFIED");
+        RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
+
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, REDIRECTED, MEDIA, null, true, true, PORT,
+                purifier, rewriter);
+
+        assertEquals("https://cdn.a.com/path/", purifier.tsUrlPre);
+        assertEquals(REDIRECTED, rewriter.playlistUrl);
+        assertEquals(LOCAL, p.playUrl);
+        assertTrue(p.precached);
+    }
+
+    @Test
+    public void planPlaysRequestedUrlWhenRewriteNotApplicableAfterRedirect() {
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, REDIRECTED, MEDIA, null, false, true, PORT,
+                forbiddenPurifier(), new RecordingRewriter(null));
+
+        assertEquals(URL, p.playUrl);
+        assertFalse(p.setM3u8Content);
+    }
+
+    @Test
+    public void planIgnoresRedirectedUrlWhenPrecacheOff() {
+        RecordingPurifier purifier = new RecordingPurifier(null);
+
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, REDIRECTED, MEDIA, null, true, false, PORT,
+                purifier, forbiddenRewriter());
+
+        assertEquals("https://cdn.a.com/path/", purifier.tsUrlPre);
+        assertEquals(URL, p.playUrl);
+    }
+
+    @Test
+    public void finalUrlIsTheUrlOfTheLastRequestAfterRedirects() {
+        okhttp3.Response raw = new okhttp3.Response.Builder()
+                .request(new okhttp3.Request.Builder().url(REDIRECTED).build())
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .build();
+
+        assertEquals(REDIRECTED, M3u8PlayPlanner.finalUrl(raw, URL));
+    }
+
+    @Test
+    public void finalUrlFallsBackToRequestedUrlWithoutRawResponse() {
+        assertEquals(URL, M3u8PlayPlanner.finalUrl(null, URL));
     }
 
     // ---------- 测试替身 ----------

@@ -713,8 +713,7 @@ public class PlayActivity extends BaseActivity {
             startPlayUrl(url, headers);
             return;
         }
-        OkGo.getInstance().cancelTag("m3u8-1");
-        OkGo.getInstance().cancelTag("m3u8-2");
+        cancelM3u8Fetch();
         //remove ads in m3u8
         HttpHeaders hheaders = new HttpHeaders();
         if (headers != null) {
@@ -736,7 +735,8 @@ public class PlayActivity extends BaseActivity {
 
                         String forwardurl = M3u8PlayPlanner.findForwardUrl(url, content);
                         if ("".equals(forwardurl)) {
-                            playPlan(plan(url, content, headers, purify, precache), headers);
+                            playM3u8(url, M3u8PlayPlanner.finalUrl(response.getRawResponse(), url), content,
+                                    headers, purify, precache);
                             return;
                         }
                         final String finalforwardurl = forwardurl;
@@ -747,7 +747,8 @@ public class PlayActivity extends BaseActivity {
                                     @Override
                                     public void onSuccess(Response<String> response) {
                                         String content = response.body();
-                                        playPlan(plan(finalforwardurl, content, headers, purify, precache), headers);
+                                        playM3u8(finalforwardurl, M3u8PlayPlanner.finalUrl(response.getRawResponse(), finalforwardurl),
+                                                content, headers, purify, precache);
                                     }
 
                                     @Override
@@ -776,13 +777,19 @@ public class PlayActivity extends BaseActivity {
                 });
     }
 
-    private M3u8PlayPlanner.Plan plan(String playlistUrl, String content, HashMap<String, String> headers,
-                                      boolean purify, boolean precache) {
-        return M3u8PlayPlanner.plan(playlistUrl, content, headers, purify, precache,
-                RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
+    private void cancelM3u8Fetch() {
+        OkGo.getInstance().cancelTag("m3u8-1");
+        OkGo.getInstance().cancelTag("m3u8-2");
     }
 
-    private void playPlan(M3u8PlayPlanner.Plan p, HashMap<String, String> headers) {
+    /** 拿到 m3u8 之后决定交给播放器什么并开始播放。离开全屏播放页之后（Activity 正在结束或已销毁）才到达的回调直接丢弃，不调用 rewrite，不留下没人用的预缓存会话。 */
+    private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
+                          boolean purify, boolean precache) {
+        if (isFinishing() || isDestroyed()) return;
+        final Object owner = precacheOwner;   // lambda 只捕获 owner，不捕获页面
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
+                RemoteServer.serverPort, M3U8::purify,
+                (u, c, h, port) -> HlsPrecache.get().rewrite(u, c, h, port, owner));
         if (p.setM3u8Content) RemoteServer.m3u8Content = p.m3u8Content;
         startPlayUrl(p.playUrl, headers, p.precached);
     }
@@ -798,7 +805,7 @@ public class PlayActivity extends BaseActivity {
 
     /** keepPrecacheSession：只有刚改写成功（plan.precached）时保留预缓存会话，其余播放都先结束上一个会话。 */
     private void startPlayUrl(String url, HashMap<String, String> headers, boolean keepPrecacheSession) {
-        if (!keepPrecacheSession) HlsPrecache.get().endSession();
+        if (!keepPrecacheSession) HlsPrecache.get().endSession(precacheOwner);
         final String finalUrl = url;
         runOnUiThread(new Runnable() {
             @Override
@@ -1265,7 +1272,7 @@ public class PlayActivity extends BaseActivity {
             // Closed playback
             if (onStopCalled) {
                 mVideoView.release();
-                HlsPrecache.get().endSession();
+                HlsPrecache.get().endSession(precacheOwner);
             }
             unregisterReceiver(pipActionReceiver);
             pipActionReceiver = null;
@@ -1286,7 +1293,8 @@ public class PlayActivity extends BaseActivity {
             mVideoView.release();
             mVideoView = null;
         }
-        HlsPrecache.get().endSession();
+        cancelM3u8Fetch();
+        HlsPrecache.get().endSession(precacheOwner);
         stopLoadWebView(true);
         stopParse();
         Thunder.stop(false); // 停止磁力下载
@@ -1296,6 +1304,11 @@ public class PlayActivity extends BaseActivity {
 
     private VodInfo mVodInfo;
     private JSONObject mVodPlayerCfg;
+    /**
+     * 本页建立的预缓存会话记在它名下，结束会话时只结束自己的：先 finish 旧 DetailActivity 再启动新页面时，
+     * 旧页面晚到的销毁不会结束新页面的会话。必须是普通 Object，不能是匿名类或 lambda（会捕获页面）。
+     */
+    private final Object precacheOwner = new Object();
     private String sourceKey;
     private SourceBean sourceBean;
 
