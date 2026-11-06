@@ -205,6 +205,11 @@ final class SegmentDownload implements Runnable {
         return new Reader(new FileInputStream(temp));
     }
 
+    /** 执行器没能运行这次下载时调用：进入 FAILED，等响应头的读者随即返回。 */
+    void notStarted() {
+        finish(State.FAILED, false);
+    }
+
     /** 不阻塞。 */
     synchronized State state() {
         return state;

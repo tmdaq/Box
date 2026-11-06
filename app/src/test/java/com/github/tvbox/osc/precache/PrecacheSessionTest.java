@@ -25,10 +25,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -292,6 +294,26 @@ public class PrecacheSessionTest {
 
         assertArrayEquals(bytes(0), play(0));
         assertEquals(2, origin.requestCount(url(0)));
+    }
+
+    @Test
+    public void rejectedDownloadDoesNotLeaveLaterRequestsWaitingForever() throws Exception {
+        AtomicInteger rejections = new AtomicInteger(1);
+        Executor rejectsFirst = r -> {
+            if (rejections.getAndDecrement() > 0) throw new RejectedExecutionException("pool is full");
+            executor.execute(r);
+        };
+        session = new PrecacheSession("abc", playlist(5), null, store, config(3, Long.MAX_VALUE), origin, rejectsFirst);
+
+        Future<SegmentResponse> first = pool.submit(() -> session.open(0));
+        try {
+            first.get(5, TimeUnit.SECONDS).close();
+        } catch (ExecutionException ignored) {
+            // 第一次请求怎么失败都可以，只要不卡住
+        }
+        Future<byte[]> again = pool.submit(() -> play(0));
+
+        assertArrayEquals(bytes(0), again.get(5, TimeUnit.SECONDS));
     }
 
     // ---- 源站错误 ----

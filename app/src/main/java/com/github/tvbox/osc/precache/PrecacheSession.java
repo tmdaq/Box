@@ -253,7 +253,14 @@ final class PrecacheSession implements SegmentDownload.Listener {
     private SegmentDownload start(HlsSegment seg, boolean prefetch) {
         SegmentDownload d = new SegmentDownload(seg, headers, prefetch, downloader, store, this);
         downloads.put(seg.index, d);
-        downloadExecutor.execute(d);
+        try {
+            downloadExecutor.execute(d);
+        } catch (RuntimeException e) {
+            // 比如 RejectedExecutionException：下载没有开始，也就不会有 onFinished，在这里收尾
+            downloads.remove(seg.index);
+            d.notStarted();
+            if (prefetch) prefetchFailed.add(seg.index);
+        }
         return d;
     }
 
