@@ -13,6 +13,8 @@ import android.app.Application;
 
 import androidx.test.core.app.ApplicationProvider;
 
+import com.github.tvbox.osc.R;
+
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -32,7 +34,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.TreeSet;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import fi.iki.elonen.NanoHTTPD;
@@ -85,13 +90,25 @@ public class RemoteServerSegmentRouteTest {
 
     @Test
     public void nonLoopbackRequestsGet403WithoutReachingTheSeam() throws IOException {
-        for (String ip : Arrays.asList("192.168.1.20", "10.0.0.2", "", null)) {
+        for (String ip : Arrays.asList("192.168.1.20", "10.0.0.2", "127.0.0.2", "", null)) {
             Response response = server.serve(segmentSession(Method.GET, ip, params("abc", "3")));
 
             assertEquals(ip, 403, response.getStatus().getRequestStatus());
             assertEquals(ip, NanoHTTPD.MIME_PLAINTEXT, response.getMimeType());
             assertEquals(ip, 0, readAll(response.getData()).length);
         }
+        assertTrue(server.calls.isEmpty());
+    }
+
+    @Test
+    public void forgedLoopbackHeadersFromLanStillGet403WithoutReachingTheSeam() {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("x-forwarded-for", "127.0.0.1");
+        headers.put("remote-addr", "127.0.0.1");
+
+        Response response = server.serve(segmentSession(Method.GET, "192.168.1.20", params("abc", "3"), headers));
+
+        assertEquals(403, response.getStatus().getRequestStatus());
         assertTrue(server.calls.isEmpty());
     }
 
@@ -115,9 +132,10 @@ public class RemoteServerSegmentRouteTest {
     }
 
     @Test
-    public void postDoesNotReachTheSeam() {
-        server.serve(segmentSession(Method.POST, "127.0.0.1", params("abc", "3")));
+    public void postFallsBackToDefaultPageWithoutReachingTheSeam() throws IOException {
+        Response response = server.serve(segmentSession(Method.POST, "127.0.0.1", params("abc", "3")));
 
+        assertDefaultPage(response);
         assertTrue(server.calls.isEmpty());
     }
 
@@ -169,6 +187,64 @@ public class RemoteServerSegmentRouteTest {
         assertEquals("HTTP/1.1 502 Bad Gateway", response.statusLine);
         assertEquals("0", response.header("Content-Length"));
         assertNull(response.header("Content-Encoding"));
+        // 只有 NanoHTTPD 自己写的 Date、Connection，加上 Content-Type 和长度
+        assertEquals(new TreeSet<>(Arrays.asList("Connection", "Content-Length", "Content-Type", "Date")),
+                new TreeSet<>(response.headers.keySet()));
+    }
+
+    @Test
+    public void nullBodyIsSentAsZeroLengthWhateverLengthIsGiven() throws IOException {
+        for (long length : new long[]{123, -1}) {
+            SeamServer nullBodyServer = new SeamServer();
+            nullBodyServer.handler = (s, i) -> SegmentProxyResponse.create(502, NanoHTTPD.MIME_PLAINTEXT, null, length, null);
+            nullBodyServer.start();
+            try {
+                RawHttpClient.Response response = RawHttpClient.get(nullBodyServer.getListeningPort(), SEGMENT_URL, ACCEPT_GZIP);
+
+                assertEquals("length " + length, "0", response.header("Content-Length"));
+                assertNull("length " + length, response.header("Transfer-Encoding"));
+                assertEquals("length " + length, 0, response.body.length);
+            } finally {
+                nullBodyServer.stop();
+            }
+        }
+    }
+
+    @Test
+    public void fixedLengthBodyIsSentAsItIsRead() throws Exception {
+        GatedStream body = new GatedStream();
+        server.handler = (s, i) -> SegmentProxyResponse.create(200, TS, body, GatedStream.LENGTH, null);
+        server.start();
+
+        try (Socket socket = openSegmentRequest()) {
+            InputStream in = socket.getInputStream();
+            assertEquals(String.valueOf(GatedStream.LENGTH), RawHttpClient.readHeaders(in).get("Content-Length"));
+
+            assertArrayEquals(GatedStream.FIRST, RawHttpClient.readBytes(in, GatedStream.FIRST.length));
+            body.release();
+            assertArrayEquals(GatedStream.REST, RawHttpClient.readRemaining(in));
+        } finally {
+            body.release();
+        }
+    }
+
+    @Test
+    public void chunkedBodyIsSentAsItIsRead() throws Exception {
+        GatedStream body = new GatedStream();
+        server.handler = (s, i) -> SegmentProxyResponse.create(200, TS, body, -1, null);
+        server.start();
+
+        try (Socket socket = openSegmentRequest()) {
+            InputStream in = socket.getInputStream();
+            assertEquals("chunked", RawHttpClient.readHeaders(in).get("Transfer-Encoding"));
+
+            assertArrayEquals(GatedStream.FIRST, RawHttpClient.readChunk(in));
+            body.release();
+            assertArrayEquals(GatedStream.REST, RawHttpClient.readChunk(in));
+            assertNull(RawHttpClient.readChunk(in));
+        } finally {
+            body.release();
+        }
     }
 
     @Test
@@ -189,14 +265,8 @@ public class RemoteServerSegmentRouteTest {
         server.handler = (s, i) -> SegmentProxyResponse.create(200, TS, new EndlessStream(), -1, closes::incrementAndGet);
         server.start();
 
-        try (Socket socket = new Socket("127.0.0.1", server.getListeningPort())) {
-            socket.setSoTimeout((int) WAIT_MS);
-            RawHttpClient.writeRequest(socket.getOutputStream(), SEGMENT_URL, ACCEPT_GZIP);
-            InputStream in = socket.getInputStream();
-            assertEquals("HTTP/1.1 200 OK", RawHttpClient.readLine(in).trim());
-            while (!RawHttpClient.readLine(in).isEmpty()) {
-                // 读完响应头就断开
-            }
+        try (Socket socket = openSegmentRequest()) {
+            RawHttpClient.readHeaders(socket.getInputStream()); // 读完响应头就断开
         }
 
         awaitTrue(() -> closes.get() > 0);
@@ -205,9 +275,27 @@ public class RemoteServerSegmentRouteTest {
 
     // ---- helpers ----
 
+    /** 发出分片请求并读掉状态行（断言 200），流停在响应头开头。 */
+    private Socket openSegmentRequest() throws IOException {
+        Socket socket = new Socket("127.0.0.1", server.getListeningPort());
+        socket.setSoTimeout((int) WAIT_MS);
+        RawHttpClient.writeRequest(socket.getOutputStream(), SEGMENT_URL, ACCEPT_GZIP);
+        assertEquals("HTTP/1.1 200 OK", RawHttpClient.readLine(socket.getInputStream()).trim());
+        return socket;
+    }
+
     private RawHttpClient.Response getSegment() throws IOException {
         server.start();
         return RawHttpClient.get(server.getListeningPort(), SEGMENT_URL, ACCEPT_GZIP);
+    }
+
+    /** 同 RemoteServerRoutesTest：默认页是 R.raw.index 的原始字节。 */
+    private static void assertDefaultPage(Response response) throws IOException {
+        assertEquals(Response.Status.OK, response.getStatus());
+        assertEquals(NanoHTTPD.MIME_HTML + "; charset=utf-8", response.getMimeType());
+        try (InputStream index = ApplicationProvider.getApplicationContext().getResources().openRawResource(R.raw.index)) {
+            assertArrayEquals(readAll(index), readAll(response.getData()));
+        }
     }
 
     private static Map<String, String> params(String session, String index) {
@@ -218,11 +306,17 @@ public class RemoteServerSegmentRouteTest {
     }
 
     private static IHTTPSession segmentSession(Method method, String remoteIp, Map<String, String> params) {
+        return segmentSession(method, remoteIp, params, new HashMap<String, String>());
+    }
+
+    /** headers 的键用小写，和 NanoHTTPD 解析后的一样。 */
+    private static IHTTPSession segmentSession(Method method, String remoteIp, Map<String, String> params,
+                                               Map<String, String> headers) {
         IHTTPSession session = mock(IHTTPSession.class);
         when(session.getMethod()).thenReturn(method);
         when(session.getUri()).thenReturn("/hlsseg");
         when(session.getParms()).thenReturn(params);
-        when(session.getHeaders()).thenReturn(new HashMap<String, String>());
+        when(session.getHeaders()).thenReturn(headers);
         when(session.getRemoteIpAddress()).thenReturn(remoteIp);
         return session;
     }
@@ -271,6 +365,54 @@ public class RemoteServerSegmentRouteTest {
         Response openSegment(String sessionId, String index) {
             calls.add(new String[]{sessionId, index});
             return handler.open(sessionId, index);
+        }
+    }
+
+    /**
+     * 分两段放行的 body：第一次 read 立刻返回 FIRST，之后的 read 等到测试调用 release() 才返回 REST，然后 EOF。
+     * 客户端在 release() 之前就读到 FIRST，说明服务端是边取边发，而不是读完整个 body 再发。
+     */
+    private static final class GatedStream extends InputStream {
+        private static final byte[] ALL = randomBytes(1316); // 7 个 188 字节的 TS 包
+        static final byte[] FIRST = Arrays.copyOfRange(ALL, 0, 752);
+        static final byte[] REST = Arrays.copyOfRange(ALL, 752, ALL.length);
+        static final int LENGTH = ALL.length;
+
+        private final CountDownLatch gate = new CountDownLatch(1);
+        private int part;
+
+        void release() {
+            gate.countDown();
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            return read(one, 0, 1) < 0 ? -1 : one[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (part == 0) return take(FIRST, b, off, len);
+            awaitGate();
+            return part == 1 ? take(REST, b, off, len) : -1;
+        }
+
+        /** 测试保证 len 足够大，一次把整段交出去。 */
+        private int take(byte[] chunk, byte[] b, int off, int len) {
+            if (len < chunk.length) throw new IllegalStateException("buffer too small: " + len);
+            System.arraycopy(chunk, 0, b, off, chunk.length);
+            part++;
+            return chunk.length;
+        }
+
+        private void awaitGate() throws IOException {
+            try {
+                if (!gate.await(2 * WAIT_MS, TimeUnit.MILLISECONDS)) throw new IOException("gate never released");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
         }
     }
 
