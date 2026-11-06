@@ -33,6 +33,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class PrecacheSessionTest {
 
@@ -517,6 +518,32 @@ public class PrecacheSessionTest {
         gate.countDown();
         assertArrayEquals(bytes(0), readAll(first.body));
         assertArrayEquals(bytes(50), readAll(jumped.body));
+    }
+
+    @Test
+    public void playerWaitingOnAPrefetchCancelledByAJumpRetriesAsAMiss() throws Exception {
+        CountDownLatch headers = gate();
+        origin.on(url(1)).body(bytes(1)).holdHeaders(headers);
+        newSession(100);
+        play(0);
+        awaitRequested(1);
+        AtomicReference<Thread> player = new AtomicReference<>();
+        Future<SegmentResponse> seg1 = pool.submit(() -> {
+            player.set(Thread.currentThread());
+            return session.open(1);
+        });
+        // 播放器在等 seg1 这个预缓存下载的响应头（awaitHeaders 里的 wait()）
+        eventually("player waits for the prefetch", () -> player.get() != null
+                && player.get().getState() == Thread.State.WAITING);
+
+        assertArrayEquals(bytes(50), play(50));
+        assertTrue("the jump cancels the prefetch the player waits for", origin.wasCancelled(url(1)));
+        headers.countDown();
+
+        SegmentResponse r = seg1.get(5, TimeUnit.SECONDS);
+        assertEquals(200, r.status);
+        assertArrayEquals(bytes(1), readAll(r.body));
+        assertEquals("retried once as a miss", 2, origin.requestCount(url(1)));
     }
 
     @Test
