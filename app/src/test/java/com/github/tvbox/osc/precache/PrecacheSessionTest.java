@@ -396,15 +396,15 @@ public class PrecacheSessionTest {
         awaitIdle();
         assertEquals("prefetch of seg1 was attempted", 1, origin.requestCount(url(1)));
         int before = submitted.get();
-        int requestsBefore = origin.requestCount(url(5));
 
-        assertArrayEquals(bytes(5), play(5));
+        // seg15 在第 0 片的窗口之外，降级前不可能被预缓存
+        assertArrayEquals(bytes(15), play(15));
         assertArrayEquals(bytes(0), play(0));
 
         assertEquals("no download is scheduled after degrading", before, submitted.get());
-        assertEquals("forwarded to origin", requestsBefore + 1, origin.requestCount(url(5)));
+        assertEquals("forwarded to origin", 1, origin.requestCount(url(15)));
+        assertFalse("forwarding does not write to disk", store.isCommitted(key(15)));
         assertEquals("committed segments are not read any more", 2, origin.requestCount(url(0)));
-        assertFalse(store.isCommitted(key(5)));
     }
 
     private int statusAfterPlan(int index, int code) {
