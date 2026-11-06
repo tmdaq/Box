@@ -159,7 +159,7 @@ private void playUrl(String url, HashMap<String, String> headers, boolean precac
     //     playM3u8(finalforwardurl, finalUrl(response.getRawResponse(), finalforwardurl), content, ...);   // 替换 :763-770
 }
 
-private void cancelM3u8Fetch() {          // playUrl 开头和离开播放页时（D6）各调一次
+private void cancelM3u8Fetch() {          // 只在 playUrl 开头调用，和 main 一致；离开播放页时不调用（D6）
     OkGo.getInstance().cancelTag("m3u8-1");
     OkGo.getInstance().cancelTag("m3u8-2");
 }
@@ -255,10 +255,11 @@ private void startPlayUrl(String url, HashMap<String, String> headers, boolean k
 | `PlayActivity.onDestroy` | 在 `mVideoView.release()` 之后加同样一行 | 离开全屏播放页 |
 | `PlayActivity.onPictureInPictureModeChanged` 的 `else` 分支 | 在 `if (onStopCalled) { mVideoView.release(); }` 里，release 之后加同样一行 | 用户关掉画中画小窗，播放器已经释放；Activity 不一定马上销毁，不在这里结束的话，会话会一直留到 Activity 销毁 |
 
-**晚到的 m3u8 回调**：OkGo 回调在主线程派发，离开播放页时可能已经在队列里。只结束会话不够，回调之后还会 `rewrite` 出一个没人用的新会话。所以两处都要做：
+**晚到的 m3u8 回调**：OkGo 回调在主线程派发，离开播放页时可能已经在队列里。只结束会话不够，回调之后还会 `rewrite` 出一个没人用的新会话。做法：
 
-- `PlayFragment.onDestroyView`、`PlayActivity.onDestroy` 在 `endSession` 之前调 `cancelM3u8Fetch()`，取消还在进行的 `m3u8-1` / `m3u8-2` 请求；
-- `playM3u8` 在调用 `plan()` 之前检查页面还在不在（PlayFragment 用 `isAdded()`，PlayActivity 用 `isFinishing() || isDestroyed()`），不在就直接返回，不调用 `rewrite`。拉取失败、内容不是 m3u8 的回退走 `startPlayUrl`，它本来就只结束会话、不建会话，页面不在时由它自己的检查返回（PlayFragment 是 `isAdded()`，PlayActivity 是 `mVideoView == null`）。
+- 每个页面有一个 `volatile boolean m3u8Closed`：`PlayFragment.onDestroyView`、`PlayActivity.onDestroy` 和 `PlayActivity` 关闭画中画小窗的分支在 `endSession(owner)` 之前把它设为 true；`playUrl` 发起 m3u8 拉取前把它复位为 false。
+- `playM3u8` 在调用 `plan()` 之前检查页面还在不在（PlayFragment 用 `!isAdded() || m3u8Closed`，PlayActivity 用 `isFinishing() || isDestroyed() || m3u8Closed`），不在就直接返回，不调用 `rewrite`，也不写 `RemoteServer.m3u8Content`。
+- **离开播放页时不 `cancelTag`**（第 1 轮返工曾这样做，复查发现回归后撤回）：`m3u8-1` / `m3u8-2` 是进程内全局字符串，旧页面晚到的销毁会把新页面正在进行的 m3u8 拉取取消掉；OkGo 3.0.4 对已取消的请求既不回调 `onSuccess` 也不回调 `onError`，新页面会卡在加载，而且和预缓存开关无关。所以 `cancelM3u8Fetch()` 只保留在 `playUrl` 开头，和 main 一致。拉取失败、内容不是 m3u8 的回退走 `startPlayUrl`，它本来就只结束会话、不建会话，页面不在时由它自己的检查返回（PlayFragment 是 `isAdded()`，PlayActivity 是 `mVideoView == null`）。
 
 **只结束本页的会话**：`BaseActivity` 后台设置为画中画时（`BaseActivity.java:254-260`）和推送 `receiver/DetailReceiver.java:24-28` 都是先 finish 旧的 DetailActivity、再启动新的。旧页面的 `onDestroyView` / `onDestroy` 可能在新页面已经 `rewrite` 之后才执行；无条件的 `endSession()` 会把新页面的会话结束掉，新播放器之后请求分片拿到 410。所以：
 
@@ -406,7 +407,8 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
    - 在同一集上按「重播」：会话目录名不变（复用），已下载的 `.seg` 文件仍在。
    - 返回退出播放页：目录在几秒内被清空。杀进程后重启 App：`hlscache/` 不存在或为空。
    - **启动清理不阻塞主线程**：开启预缓存播放 5 分钟以上，再换两部片各播 5 分钟（留下较大的会话目录），播放中 `adb shell am force-stop com.github.tvbox.osc.tk` 杀进程。重启 App：首页正常出现、没有 ANR 弹窗；启动后立刻 `adb shell ls /sdcard/Android/data/com.github.tvbox.osc.tk/cache/` 可能看到 `hlscache.trash-<时间戳>`，几秒后它消失；`hlscache/` 不存在，或者只有新会话的目录。
-   - **晚到的 m3u8 回调**：用第 7 项的限速环境（或代理工具给 m3u8 请求加 5 秒延迟），从详情页进入全屏播放页后、画面出来之前立刻按返回；对详情页小窗也做一次（进入详情页后立刻返回）。等 10 秒后看目录：不出现新的会话目录；`adb logcat | grep -i okgo` 里能看到 m3u8 请求被取消，或者回调到达后没有任何播放动作。
+   - **晚到的 m3u8 回调**：用第 7 项的限速环境（或代理工具给 m3u8 请求加 5 秒延迟），从详情页进入全屏播放页后、画面出来之前立刻按返回；对详情页小窗也做一次（进入详情页后立刻返回）。等 10 秒后看目录：不出现新的会话目录；回调到达后没有任何播放动作（`curl` 本地 `/m3u8` 的内容也没有变成这次拉取的结果）。
+   - **旧页面销毁不取消新页面的 m3u8 拉取**：「设置 → 后台」设为「画中画」，给 m3u8 请求加 5 秒延迟；详情页 A 小窗播放时按 Home 进入画中画，马上回首页打开影片 B 的详情页（会先 finish A）。B 在 5 秒延迟后仍能正常起播，不会一直停在加载。预缓存开关关闭时再做一次，结果相同。
 7. **限速环境下对比卡顿**：用路由器限速或电脑热点加 Network Link Conditioner，把带宽限到略高于片源码率（比如码率的 1.2 倍）。
    - 预缓存关闭时播放 10 分钟，记录卡顿（出现缓冲转圈）的次数和总时长。
    - 预缓存开启时播放同一片源同一段 10 分钟，记录同样的数据。

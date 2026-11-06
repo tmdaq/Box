@@ -696,6 +696,7 @@ public class PlayFragment extends BaseLazyFragment {
             startPlayUrl(url, headers);
             return;
         }
+        m3u8Closed = false;
         cancelM3u8Fetch();
         //remove ads in m3u8
         HttpHeaders hheaders = new HttpHeaders();
@@ -770,7 +771,7 @@ public class PlayFragment extends BaseLazyFragment {
     /** 拿到 m3u8 之后决定交给播放器什么并开始播放。离开详情页之后（Fragment 已经 detach）才到达的回调直接丢弃，不调用 rewrite，不留下没人用的预缓存会话。 */
     private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
                           boolean purify, boolean precache) {
-        if (!isAdded()) return;
+        if (!isAdded() || m3u8Closed) return;
         final Object owner = precacheOwner;   // lambda 只捕获 owner，不捕获页面
         M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
                 RemoteServer.serverPort, M3U8::purify,
@@ -1163,7 +1164,9 @@ public class PlayFragment extends BaseLazyFragment {
             mVideoView.release();
             mVideoView = null;
         }
-        cancelM3u8Fetch();
+        // 不在这里 cancelTag：m3u8 的 tag 是全局字符串，旧页面晚到的销毁会取消新页面的拉取（OkGo 对已取消的请求不回调，新页面会卡在加载）。
+        // 晚到的回调由 playM3u8 里的 m3u8Closed 检查丢弃。
+        m3u8Closed = true;
         HlsPrecache.get().endSession(precacheOwner);
         stopLoadWebView(true);
         stopParse();
@@ -1183,6 +1186,8 @@ public class PlayFragment extends BaseLazyFragment {
      * 旧页面晚到的销毁不会结束新页面的会话。必须是普通 Object，不能是匿名类或 lambda（会捕获页面）。
      */
     private final Object precacheOwner = new Object();
+    /** 页面已离开（onDestroyView 之后）；晚到的 m3u8 回调据此丢弃。下一次 playUrl 拉取 m3u8 时复位。 */
+    private volatile boolean m3u8Closed;
     private String sourceKey;
     private SourceBean sourceBean;
 
