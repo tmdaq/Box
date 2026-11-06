@@ -3,6 +3,7 @@ package com.github.tvbox.osc.server;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import org.junit.Test;
 
@@ -76,6 +77,17 @@ public class SegmentProxyResponseTest {
     }
 
     @Test
+    public void resourceIsClosedOnceEvenWhenClosingBodyThrows() {
+        CountingCloseable resource = new CountingCloseable();
+        SegmentProxyResponse response = SegmentProxyResponse.create(200, TS, new FailingCloseStream(), -1, resource);
+
+        assertCloseThrows(response);
+        assertCloseThrows(response);
+
+        assertEquals(1, resource.closes);
+    }
+
+    @Test
     public void closingWithoutResourceDoesNotThrow() throws IOException {
         SegmentProxyResponse.create(200, TS, new TrackingStream(), -1, null).close();
     }
@@ -87,6 +99,15 @@ public class SegmentProxyResponseTest {
         assertEquals(403, response.getStatus().getRequestStatus());
         assertEquals(NanoHTTPD.MIME_PLAINTEXT, response.getMimeType());
         assertEquals(0, readAll(response.getData()).length);
+    }
+
+    private static void assertCloseThrows(SegmentProxyResponse response) {
+        try {
+            response.close();
+            fail("body.close() 的 IOException 应该抛出来");
+        } catch (IOException expected) {
+            assertEquals(FailingCloseStream.MESSAGE, expected.getMessage());
+        }
     }
 
     private static void assertStatus(int code, String description) {
@@ -115,6 +136,19 @@ public class SegmentProxyResponseTest {
         public void close() throws IOException {
             closed = true;
             super.close();
+        }
+    }
+
+    private static final class FailingCloseStream extends ByteArrayInputStream {
+        static final String MESSAGE = "body close failed";
+
+        FailingCloseStream() {
+            super(new byte[]{1, 2, 3});
+        }
+
+        @Override
+        public void close() throws IOException {
+            throw new IOException(MESSAGE);
         }
     }
 
