@@ -23,6 +23,7 @@ import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -201,6 +202,53 @@ public class HlsPrecacheTest {
     }
 
     // ---- 会话复用与清空 ----
+
+    @Test
+    public void rewritingAnotherPlaylistCancelsDownloadsOfThePreviousSession() throws Exception {
+        assertPreviousDownloadsCancelledBy(() -> rewrite(URL_B));
+    }
+
+    @Test
+    public void rewritingTheSamePlaylistCancelsDownloadsOfThePreviousSession() throws Exception {
+        assertPreviousDownloadsCancelledBy(() -> rewrite(URL_A));
+    }
+
+    @Test
+    public void endSessionCancelsDownloadsOfTheSession() throws Exception {
+        assertPreviousDownloadsCancelledBy(() -> precache.endSession());
+    }
+
+    /** 会话 A 有 3 个下载卡在 body 上（播放器的 seg0 和预缓存的 seg1、seg2），执行 action 后它们都要被取消。 */
+    private void assertPreviousDownloadsCancelledBy(Runnable action) throws Exception {
+        CountDownLatch gate = new CountDownLatch(1);
+        origin.holdDefaultBody(10, gate);
+        try {
+            String id = sessionId(rewrite(URL_A));
+            SegmentResponse first = precache.openSegment(id, "0");
+            assertEquals(200, first.status);
+            String[] segs = {"https://cdn.example.com/a/seg0.ts", "https://cdn.example.com/a/seg1.ts",
+                    "https://cdn.example.com/a/seg2.ts"};
+            awaitRequested(segs);
+
+            action.run();
+
+            for (String seg : segs) assertTrue(seg + " cancelled", origin.wasCancelled(seg));
+            first.close();
+        } finally {
+            gate.countDown();
+        }
+    }
+
+    /** 等到这些地址都已发出请求：下载已经建好 Call，之后的 cancel 一定会落到 Call 上。 */
+    private void awaitRequested(String... urls) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5000;
+        for (String url : urls) {
+            while (origin.requestCount(url) == 0) {
+                if (System.currentTimeMillis() > deadline) throw new AssertionError(url + " was not requested");
+                Thread.sleep(10);
+            }
+        }
+    }
 
     @Test
     public void samePlaylistUrlReusesDownloadedSegmentsAndKeepsDirectory() throws Exception {
