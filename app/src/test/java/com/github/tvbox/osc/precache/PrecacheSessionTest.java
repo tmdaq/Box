@@ -145,6 +145,11 @@ public class PrecacheSessionTest {
         }
     }
 
+    /** 等到这些分片都已向源站发出请求：下载已经建好 Call，之后的 cancel 一定会落到 Call 上。 */
+    private void awaitRequested(int... indexes) throws InterruptedException {
+        for (int i : indexes) eventually("seg" + i + " requested", () -> origin.requestCount(url(i)) == 1);
+    }
+
     /** 等到所有下载都已跑完（包括 onFinished 里的 pump）。 */
     private void awaitIdle() throws InterruptedException {
         eventually("idle", () -> running.get() == 0);
@@ -383,7 +388,7 @@ public class PrecacheSessionTest {
         origin.holdDefaultBody(10, gate);
         newSession(100);
         SegmentResponse first = session.open(0);
-        eventually("prefetch started", () -> origin.requestCount(url(2)) == 1);
+        awaitRequested(0, 1, 2);
 
         SegmentResponse jumped = session.open(50);
 
@@ -443,21 +448,27 @@ public class PrecacheSessionTest {
 
     @Test
     public void threeThrottleSignalsDropConcurrencyToOneForGood() throws Exception {
-        CountDownLatch gate = gate();
-        origin.on(url(0)).body(bytes(0)).holdBody(10, gate);
+        CountDownLatch playerGate = gate();
+        CountDownLatch prefetchGate = gate();
+        origin.on(url(0)).body(bytes(0)).holdBody(10, playerGate);
         origin.on(url(1)).code(429);
         origin.on(url(2)).code(503);
         origin.on(url(3)).error(new ConnectException("refused"));
+        // 其余分片都卡在 body 上，结束的只有 3 个限流信号，信号到达的先后不影响结果
+        origin.holdDefaultBody(10, prefetchGate);
         newSession(40);
 
         SegmentResponse first = session.open(0);
-        // 第 3 个信号之前最多再开始 seg4；之后只剩被卡住的播放器下载，它独占唯一的并发名额
-        eventually("only the held player download is left",
-                () -> origin.requestCount(url(3)) == 1 && running.get() == 1);
-        assertEquals("throttled before the window fills", 0, origin.requestCount(url(6)));
+        // 前两个信号各空出一个名额，补上 seg3、seg4；第 3 个信号之后降到 1 个，不再补。
+        // running 在 seg1–3 都跑完之前一直是 3，所以等到 2 就说明 3 个信号都已到达。
+        eventually("three throttle signals arrived", () -> running.get() == 2);
+        assertEquals(1, origin.requestCount(url(4)));
+        assertEquals("throttled before the window fills", 0, origin.requestCount(url(5)));
 
+        prefetchGate.countDown();
+        eventually("seg4 committed", () -> store.isCommitted(key(4)));
         origin.resetMaxInFlight();
-        gate.countDown();
+        playerGate.countDown();
         readAll(first.body);
         awaitIdle();
         assertEquals(1, origin.maxInFlight());
@@ -478,7 +489,7 @@ public class PrecacheSessionTest {
         origin.holdDefaultBody(10, gate);
         newSession(40);
         SegmentResponse first = session.open(0);
-        eventually("prefetch started", () -> origin.requestCount(url(2)) == 1);
+        awaitRequested(0, 1, 2);
 
         session.close();
         session.close();
