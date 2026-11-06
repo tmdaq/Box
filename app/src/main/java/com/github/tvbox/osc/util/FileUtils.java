@@ -6,6 +6,7 @@ import android.util.Base64;
 
 import com.github.catvod.utils.Path;
 import com.github.tvbox.osc.base.App;
+import com.github.tvbox.osc.precache.HlsPrecache;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.util.StringUtils;
 import com.github.tvbox.osc.util.urlhttp.OkHttpUtil;
@@ -34,6 +35,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executor;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import okhttp3.Response;
@@ -319,9 +321,39 @@ public class FileUtils {
     }
 
     public static void cleanPlayerCache() {
-        recursiveDelete(new File(getCachePath() + File.separator + "thunder"));
-        recursiveDelete(new File(getExternalCachePath() + File.separator + "ijkcaches"));
-        recursiveDelete(new File(getExternalCachePath() + File.separator + "jpali" + File.separator + "Downloads"));
+        cleanPlayerCache(getCachePath(), getExternalCachePath(), System.currentTimeMillis(),
+                task -> new Thread(task, "hlscache-trash").start());
+    }
+
+    /** hlscache 改名后的前缀，后面接时间戳。 */
+    private static final String HLS_TRASH_PREFIX = HlsPrecache.CACHE_DIR_NAME + ".trash-";
+
+    /**
+     * 包内可见，供测试传入临时目录、时间戳和后台执行器。
+     * hlscache 里可能残留好几个最多 300MB 的会话目录，不能在主线程递归删除：
+     * 调用线程上只把它改名为 hlscache.trash-<now>（同一文件系统内的 rename，很快而且是原子的），
+     * 之后 hlscache 这个路径就是空的，新会话可以马上使用；所有 hlscache.trash-* 交给 background 删除，
+     * 以前没删完的也一起删掉。改名失败而目录还在时，退回在调用线程上同步删除，保证不会和新会话竞争。
+     */
+    static void cleanPlayerCache(String cachePath, String externalCachePath, long now, Executor background) {
+        recursiveDelete(new File(cachePath + File.separator + "thunder"));
+        recursiveDelete(new File(externalCachePath + File.separator + "ijkcaches"));
+        recursiveDelete(new File(externalCachePath + File.separator + "jpali" + File.separator + "Downloads"));
+        File externalCacheDir = new File(externalCachePath);
+        moveHlsCacheAside(externalCacheDir, now);
+        background.execute(() -> deleteHlsTrash(externalCacheDir));
+    }
+
+    private static void moveHlsCacheAside(File externalCacheDir, long now) {
+        File hlsCache = new File(externalCacheDir, HlsPrecache.CACHE_DIR_NAME);
+        if (!hlsCache.exists()) return;
+        if (!hlsCache.renameTo(new File(externalCacheDir, HLS_TRASH_PREFIX + now))) recursiveDelete(hlsCache);
+    }
+
+    private static void deleteHlsTrash(File externalCacheDir) {
+        File[] trash = externalCacheDir.listFiles((dir, name) -> name.startsWith(HLS_TRASH_PREFIX));
+        if (trash == null) return;
+        for (File dir : trash) recursiveDelete(dir);
     }
 
     public static String getFileName(String filePath) {

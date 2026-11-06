@@ -98,6 +98,15 @@ android {
     lint {
         disable 'UnsafeOptInUsageError'
     }
+
+    testOptions {
+        unitTests {
+            // Robolectric 需要读取合并后的资源
+            includeAndroidResources = true
+            // 纯 JVM 测试里 android.util.Log 等桩方法返回默认值，而不是抛异常
+            returnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -182,6 +191,12 @@ dependencies {
         exclude group: 'stax', module: 'stax-api'
         exclude group: 'xpp3', module: 'xpp3'
     }
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.mockito:mockito-core:4.11.0'
+    testImplementation 'org.robolectric:robolectric:4.11.1'
+    testImplementation 'androidx.test:core:1.5.0'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:3.12.11'
     configurations {
         configureEach {
             exclude group: 'xpp3', module: 'xpp3'

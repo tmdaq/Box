@@ -11,6 +11,7 @@ import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.base.App;
 import com.github.tvbox.osc.api.ApiConfig;
 import com.github.tvbox.osc.event.ServerEvent;
+import com.github.tvbox.osc.precache.HlsPrecache;
 import com.github.tvbox.osc.util.FileUtils;
 import com.github.tvbox.osc.util.OkGoHelper;
 import com.google.gson.Gson;
@@ -135,6 +136,9 @@ public class RemoteServer extends NanoHTTPD {
                 fileName = fileName.substring(0, fileName.indexOf('?'));
             }
             if (session.getMethod() == Method.GET) {
+                if (fileName.equals(HlsPrecache.SEGMENT_PATH)) {
+                    return serveSegment(session);
+                }
                 for (RequestProcess process: getRequestList) {
                     if (process.isRequest(session, fileName)) {
                         return process.doResponse(session, fileName, session.getParms(), null);
@@ -285,6 +289,39 @@ public class RemoteServer extends NanoHTTPD {
         }
         //default page: index.html
         return getRequestList.get(0).doResponse(session, "", null, null);
+    }
+
+    /** 分片代理：只接受本机请求，其余返回 403，且不触达预缓存核心。 */
+    private Response serveSegment(IHTTPSession session) {
+        if (!isLoopback(session.getRemoteIpAddress())) return SegmentProxyResponse.empty(403);
+        Map<String, String> parms = session.getParms();
+        try {
+            return openSegment(parms.get(HlsPrecache.PARAM_SESSION), parms.get(HlsPrecache.PARAM_INDEX));
+        } catch (Throwable th) {
+            return SegmentProxyResponse.empty(500);
+        }
+    }
+
+    /** 测试接缝：分片代理的实际处理。默认交给 HLS 预缓存核心。 */
+    Response openSegment(String sessionId, String index) {
+        return SegmentProxyResponse.from(HlsPrecache.get().openSegment(sessionId, index));
+    }
+
+    /**
+     * 只认套接字对端地址的回环字面量，不看请求头，也不做解析
+     * （InetAddress.getByName(null / "") 会返回回环地址）。
+     */
+    static boolean isLoopback(String remoteIp) {
+        return "127.0.0.1".equals(remoteIp)
+                || "::1".equals(remoteIp)
+                || "0:0:0:0:0:0:0:1".equals(remoteIp)
+                || "::ffff:127.0.0.1".equals(remoteIp);
+    }
+
+    /** 分片代理的响应不做 gzip：分片是二进制透传，text/* 的分片也必须原样返回。 */
+    @Override
+    protected boolean useGzipWhenAccepted(Response r) {
+        return !(r instanceof SegmentProxyResponse) && super.useGzipWhenAccepted(r);
     }
 
     public void setDataReceiver(DataReceiver receiver) {

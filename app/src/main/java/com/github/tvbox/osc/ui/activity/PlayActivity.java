@@ -72,6 +72,7 @@ import com.github.tvbox.osc.player.thirdparty.Kodi;
 import com.github.tvbox.osc.player.thirdparty.MXPlayer;
 import com.github.tvbox.osc.player.thirdparty.ReexPlayer;
 import com.github.tvbox.osc.server.ControlManager;
+import com.github.tvbox.osc.precache.HlsPrecache;
 import com.github.tvbox.osc.server.RemoteServer;
 import com.github.tvbox.osc.subtitle.model.Subtitle;
 import com.github.tvbox.osc.ui.adapter.SelectDialogAdapter;
@@ -86,6 +87,7 @@ import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HawkUtils;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.M3U8;
+import com.github.tvbox.osc.util.M3u8PlayPlanner;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.PlayerHelper;
 import com.github.tvbox.osc.util.parser.SuperParse;
@@ -698,16 +700,21 @@ public class PlayActivity extends BaseActivity {
     }
 
     void playUrl(String url, HashMap<String, String> headers) {
-        if (!Hawk.get(HawkConfig.VIDEO_PURIFY, true)) {
+        playUrl(url, headers, true);
+    }
+
+    /** precacheAllowed：调用点是否允许走预缓存；荐片、迅雷、存储空间等特殊链接传 false。 */
+    private void playUrl(String url, HashMap<String, String> headers, boolean precacheAllowed) {
+        final boolean purify = Hawk.get(HawkConfig.VIDEO_PURIFY, true);
+        final boolean precache = precacheAllowed
+                && Hawk.get(HawkConfig.HLS_PRECACHE, false)
+                && !isExternalPlayer();
+        if (!M3u8PlayPlanner.shouldFetch(url, purify, precache)) {
             startPlayUrl(url, headers);
             return;
         }
-        if (!url.contains("://127.0.0.1/") && !url.contains(".m3u8")) {
-            startPlayUrl(url, headers);
-            return;
-        }
-        OkGo.getInstance().cancelTag("m3u8-1");
-        OkGo.getInstance().cancelTag("m3u8-2");
+        m3u8Closed = false;
+        cancelM3u8Fetch();
         //remove ads in m3u8
         HttpHeaders hheaders = new HttpHeaders();
         if (headers != null) {
@@ -722,49 +729,15 @@ public class PlayActivity extends BaseActivity {
                     @Override
                     public void onSuccess(Response<String> response) {
                         String content = response.body();
-                        if (!content.startsWith("#EXTM3U")) {
+                        if (!M3u8PlayPlanner.isPlaylist(content)) {
                             startPlayUrl(url, headers);
                             return;
                         }
 
-                        String[] lines = null;
-                        if (content.contains("\r\n"))
-                            lines = content.split("\r\n", 10);
-                        else
-                            lines = content.split("\n", 10);
-                        String forwardurl = "";
-                        boolean dealedFirst = false;
-                        for (String line : lines) {
-                            if (!"".equals(line) && line.charAt(0) != '#') {
-                                if (dealedFirst) {
-                                    //跳转行后还有内容，说明不需要跳转
-                                    forwardurl = "";
-                                    break;
-                                }
-                                if (line.endsWith(".m3u8") || line.contains(".m3u8?")) {
-                                    if (line.startsWith("http://") || line.startsWith("https://")) {
-                                        forwardurl = line;
-                                    } else if (line.charAt(0) == '/') {
-                                        int ifirst = url.indexOf('/', 9);//skip https://, http://
-                                        forwardurl = url.substring(0, ifirst) + line;
-                                    } else {
-                                        int ilast = url.lastIndexOf('/');
-                                        forwardurl = url.substring(0, ilast + 1) + line;
-                                    }
-                                }
-                                dealedFirst = true;
-                            }
-                        }
+                        String forwardurl = M3u8PlayPlanner.findForwardUrl(url, content);
                         if ("".equals(forwardurl)) {
-                            int ilast = url.lastIndexOf('/');
-
-                            RemoteServer.m3u8Content = M3U8.purify(url.substring(0, ilast + 1), content);
-                            if (RemoteServer.m3u8Content == null)
-                                startPlayUrl(url, headers);
-                            else {
-                                startPlayUrl("http://127.0.0.1:" + RemoteServer.serverPort + "/m3u8", headers);
-                                //Toast.makeText(getContext(), "已移除视频广告", Toast.LENGTH_SHORT).show();
-                            }
+                            playM3u8(url, M3u8PlayPlanner.finalUrl(response.getRawResponse(), url), content,
+                                    headers, purify, precache);
                             return;
                         }
                         final String finalforwardurl = forwardurl;
@@ -775,15 +748,8 @@ public class PlayActivity extends BaseActivity {
                                     @Override
                                     public void onSuccess(Response<String> response) {
                                         String content = response.body();
-                                        int ilast = finalforwardurl.lastIndexOf('/');
-                                        RemoteServer.m3u8Content = M3U8.purify(finalforwardurl.substring(0, ilast + 1), content);
-
-                                        if (RemoteServer.m3u8Content == null)
-                                            startPlayUrl(finalforwardurl, headers);
-                                        else {
-                                            startPlayUrl("http://127.0.0.1:" + RemoteServer.serverPort + "/m3u8", headers);
-                                            //Toast.makeText(getContext(), "已移除视频广告", Toast.LENGTH_SHORT).show();
-                                        }
+                                        playM3u8(finalforwardurl, M3u8PlayPlanner.finalUrl(response.getRawResponse(), finalforwardurl),
+                                                content, headers, purify, precache);
                                     }
 
                                     @Override
@@ -812,7 +778,35 @@ public class PlayActivity extends BaseActivity {
                 });
     }
 
+    private void cancelM3u8Fetch() {
+        OkGo.getInstance().cancelTag("m3u8-1");
+        OkGo.getInstance().cancelTag("m3u8-2");
+    }
+
+    /** 拿到 m3u8 之后决定交给播放器什么并开始播放。离开全屏播放页之后（Activity 正在结束或已销毁）才到达的回调直接丢弃，不调用 rewrite，不留下没人用的预缓存会话。 */
+    private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
+                          boolean purify, boolean precache) {
+        if (isFinishing() || isDestroyed() || m3u8Closed) return;
+        final Object owner = precacheOwner;   // lambda 只捕获 owner，不捕获页面
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
+                RemoteServer.serverPort, M3U8::purify,
+                (u, c, h, port) -> HlsPrecache.get().rewrite(u, c, h, port, owner));
+        if (p.setM3u8Content) RemoteServer.m3u8Content = p.m3u8Content;
+        startPlayUrl(p.playUrl, headers, p.precached);
+    }
+
+    /** 和 startPlayUrl 判断外部播放器的条件一致；读不到时按内置播放器处理。 */
+    private boolean isExternalPlayer() {
+        return mVodPlayerCfg != null && mVodPlayerCfg.optInt("pl", 0) >= 10;
+    }
+
     void startPlayUrl(String url, HashMap<String, String> headers) {
+        startPlayUrl(url, headers, false);
+    }
+
+    /** keepPrecacheSession：只有刚改写成功（plan.precached）时保留预缓存会话，其余播放都先结束上一个会话。 */
+    private void startPlayUrl(String url, HashMap<String, String> headers, boolean keepPrecacheSession) {
+        if (!keepPrecacheSession) HlsPrecache.get().endSession(precacheOwner);
         final String finalUrl = url;
         runOnUiThread(new Runnable() {
             @Override
@@ -1279,6 +1273,8 @@ public class PlayActivity extends BaseActivity {
             // Closed playback
             if (onStopCalled) {
                 mVideoView.release();
+                m3u8Closed = true;
+                HlsPrecache.get().endSession(precacheOwner);
             }
             unregisterReceiver(pipActionReceiver);
             pipActionReceiver = null;
@@ -1299,6 +1295,10 @@ public class PlayActivity extends BaseActivity {
             mVideoView.release();
             mVideoView = null;
         }
+        // 不在这里 cancelTag：m3u8 的 tag 是全局字符串，旧页面晚到的销毁会取消新页面的拉取（OkGo 对已取消的请求不回调，新页面会卡在加载）。
+        // 晚到的回调由 playM3u8 里的 m3u8Closed 检查丢弃。
+        m3u8Closed = true;
+        HlsPrecache.get().endSession(precacheOwner);
         stopLoadWebView(true);
         stopParse();
         Thunder.stop(false); // 停止磁力下载
@@ -1308,6 +1308,13 @@ public class PlayActivity extends BaseActivity {
 
     private VodInfo mVodInfo;
     private JSONObject mVodPlayerCfg;
+    /**
+     * 本页建立的预缓存会话记在它名下，结束会话时只结束自己的：先 finish 旧 DetailActivity 再启动新页面时，
+     * 旧页面晚到的销毁不会结束新页面的会话。必须是普通 Object，不能是匿名类或 lambda（会捕获页面）。
+     */
+    private final Object precacheOwner = new Object();
+    /** 播放已关闭（onDestroy 或关闭画中画小窗之后）；晚到的 m3u8 回调据此丢弃。下一次 playUrl 拉取 m3u8 时复位。 */
+    private volatile boolean m3u8Closed;
     private String sourceKey;
     private SourceBean sourceBean;
 
@@ -1437,16 +1444,16 @@ public class PlayActivity extends BaseActivity {
                     }
                 }
             }
-            playUrl(vs.url.replace("tvbox-drive://", ""), headers);
+            playUrl(vs.url.replace("tvbox-drive://", ""), headers, false);
             return;
         }
         if(Jianpian.isJpUrl(vs.url)){//荐片地址特殊判断
             String jp_url= vs.url;
             mController.showParse(false);
             if(vs.url.startsWith("tvbox-xg:")){
-                playUrl(Jianpian.JPUrlDec(jp_url.substring(9)), null);
+                playUrl(Jianpian.JPUrlDec(jp_url.substring(9)), null, false);
             }else {
-                playUrl(Jianpian.JPUrlDec(jp_url), null);
+                playUrl(Jianpian.JPUrlDec(jp_url), null, false);
             }
             return;
         }
@@ -1466,7 +1473,7 @@ public class PlayActivity extends BaseActivity {
 
             @Override
             public void play(String url) {
-                playUrl(url, null);
+                playUrl(url, null, false);
             }
         })) {
             mController.showParse(false);

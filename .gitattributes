@@ -1,0 +1,2 @@
+# 并行分支各自追加的字符串资源，合并时全部保留
+app/src/main/res/values*/strings.xml merge=union

@@ -1,0 +1,27 @@
+schema: spec-driven
+
+context: |
+  Android TV 影视聚合播放器（TVBox fork），Java 为主、少量 Kotlin，minSdk 21，compileSdk 34，AGP 7.4.2。
+  模块：app（主应用）、quickjs（JS 爬虫引擎）、pyramid（Python 爬虫，仅 python flavor）。
+  构建、测试命令和四阶段开发流程见仓库根目录 AGENTS.md。
+  artifact 用中文撰写；spec 里的 SHALL/MUST、WHEN/THEN/AND 保持英文关键字。
+  Issue 在 GitHub tmdaq/Box。
+
+rules:
+  proposal:
+    - "第一行写 `Issue: #<n>`，关联对应的 GitHub issue"
+    - 写明 Non-goals
+  specs:
+    - capability 沿用 openspec/specs/ 下已有的目录名，只有全新的功能领域才新建
+  design:
+    - 涉及 UI 或遥控器焦点时，写清楚手动验证步骤
+  tasks:
+    - 任务格式遵循 .agents/skills/dev-requirements/references/tasks-format.md
+
+operations:
+  apply:
+    guidance:
+      - 按 dev-implement skill 并行开发，项目配置见 docs/agents/dev-workflow.md
+  archive:
+    guidance:
+      - 归档时同步更新 docs/功能模块/ 里对应的文档
