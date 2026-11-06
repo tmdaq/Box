@@ -104,6 +104,37 @@ final class RawHttpClient {
         return new String(line.toByteArray(), StandardCharsets.ISO_8859_1);
     }
 
+    // ---- 分段读取：供需要一边读一边控制服务端的测试使用，状态行由调用方先用 readLine 读掉 ----
+
+    /** 读完响应头（到空行为止），头名不区分大小写；流停在 body 开头。 */
+    static Map<String, String> readHeaders(InputStream in) throws IOException {
+        Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+            int colon = line.indexOf(':');
+            headers.put(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
+        }
+        return headers;
+    }
+
+    /** 读正好 size 个字节。 */
+    static byte[] readBytes(InputStream in, int size) throws IOException {
+        return readExactly(in, size);
+    }
+
+    /** 读一个 chunk 的数据并跳过末尾的 CRLF；读到结束 chunk（大小为 0）时返回 null。 */
+    static byte[] readChunk(InputStream in) throws IOException {
+        int size = chunkSize(readLine(in));
+        if (size == 0) return null;
+        byte[] data = readExactly(in, size);
+        readLine(in);
+        return data;
+    }
+
+    /** 读到 EOF。 */
+    static byte[] readRemaining(InputStream in) throws IOException {
+        return readToEnd(in);
+    }
+
     static final class Response {
         final String statusLine;
         /** 头名不区分大小写。 */
