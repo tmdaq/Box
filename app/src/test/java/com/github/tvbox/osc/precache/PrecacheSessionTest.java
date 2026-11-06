@@ -562,6 +562,23 @@ public class PrecacheSessionTest {
         assertEquals(0, origin.requestCount(url(4)));
     }
 
+    @Test
+    public void playerMissIsDownloadedAndCachedEvenOverTheCap() throws Exception {
+        // 上限比一个分片还小：预缓存一个都放不下
+        newSession(40, config(3, 50));
+
+        assertArrayEquals(bytes(0), play(0));
+        awaitIdle();
+        assertEquals("a player miss is still written to disk", keys(0, 0), store.committedKeys());
+
+        // 已经超出上限，再来一个未命中照样回源、写盘（seg0 作为回看分片被淘汰，给上限腾地方）
+        assertArrayEquals(bytes(1), play(1));
+        awaitIdle();
+        assertTrue(store.isCommitted(key(1)));
+        assertEquals(1, origin.requestCount(url(1)));
+        assertEquals("no prefetch over the cap", 0, origin.requestCount(url(2)));
+    }
+
     // ---- 限流 ----
 
     @Test
