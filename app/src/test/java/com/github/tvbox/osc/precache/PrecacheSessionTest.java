@@ -231,10 +231,20 @@ public class PrecacheSessionTest {
         play(0);
         eventually("seg1 prefetch started", () -> origin.requestCount(url(1)) == 1);
 
-        Future<byte[]> seg1 = pool.submit(() -> play(1));
+        // 预缓存卡在第 10 个字节上，不可能已经提交：播放器只能跟读这次下载，先拿到前 10 个字节，再放行
+        Future<SegmentResponse> seg1 = pool.submit(() -> session.open(1));
+        SegmentResponse r = seg1.get(5, TimeUnit.SECONDS);
+        assertEquals(200, r.status);
+        byte[] head = new byte[10];
+        int off = 0;
+        while (off < head.length) off += r.body.read(head, off, head.length - off);
         gate.countDown();
+        byte[] rest = readAll(r.body);
 
-        assertArrayEquals(bytes(1), seg1.get(5, TimeUnit.SECONDS));
+        ByteArrayOutputStream all = new ByteArrayOutputStream();
+        all.write(head);
+        all.write(rest);
+        assertArrayEquals(bytes(1), all.toByteArray());
         assertEquals(1, origin.requestCount(url(1)));
     }
 
