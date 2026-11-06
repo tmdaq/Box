@@ -172,6 +172,24 @@ public class RemoteServerSegmentRouteTest {
     }
 
     @Test
+    public void nullBodyIsSentAsZeroLengthWhateverLengthIsGiven() throws IOException {
+        for (long length : new long[]{123, -1}) {
+            SeamServer nullBodyServer = new SeamServer();
+            nullBodyServer.handler = (s, i) -> SegmentProxyResponse.create(502, NanoHTTPD.MIME_PLAINTEXT, null, length, null);
+            nullBodyServer.start();
+            try {
+                RawHttpClient.Response response = RawHttpClient.get(nullBodyServer.getListeningPort(), SEGMENT_URL, ACCEPT_GZIP);
+
+                assertEquals("length " + length, "0", response.header("Content-Length"));
+                assertNull("length " + length, response.header("Transfer-Encoding"));
+                assertEquals("length " + length, 0, response.body.length);
+            } finally {
+                nullBodyServer.stop();
+            }
+        }
+    }
+
+    @Test
     public void resourceIsClosedOnceAfterSending() throws Exception {
         AtomicInteger closes = new AtomicInteger();
         byte[] segment = randomBytes(1024);
