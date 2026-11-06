@@ -8,7 +8,7 @@
 
 ## 1. 锁住现有路由
 
-- [ ] 1.1 `RemoteServer.serve` 的 characterization test，以及原始 HTTP 测试辅助类。按 design.md D7 的「characterization test 的范围」实现，共 8 条：
+- [x] 1.1 `RemoteServer.serve` 的 characterization test，以及原始 HTTP 测试辅助类。按 design.md D7 的「characterization test 的范围」实现，共 8 条：
   - `/m3u8` 返回 `m3u8Content`
   - `/` 命中 `getRequestList`
   - 未知路径落到默认页
@@ -26,7 +26,7 @@
 
 ## 2. 分片代理端点
 
-- [ ] 2.1 新增 `SegmentProxyResponse`（design.md D3、D4）：
+- [x] 2.1 新增 `SegmentProxyResponse`（design.md D3、D4）：
   - 继承 `NanoHTTPD.Response`
   - 静态方法 `from(SegmentResponse)`、`empty(int)`、`create(int, String, InputStream, long, Closeable)`
   - 内部类 `SegmentStatus`：原因短语表，表里没有的按类别兜底
@@ -45,7 +45,7 @@
   - reads: openspec/changes/add-segment-proxy-endpoint/design.md, openspec/changes/add-hls-precache-core/design.md（只读「跨 change 接口」一节）, app/src/main/java/com/github/tvbox/osc/precache/SegmentResponse.java（S1 骨架）
   - depends-on: 无（需要 S1 接口骨架已经提交）
   - verify: com.github.tvbox.osc.server.SegmentProxyResponseTest
-- [ ] 2.2 在 `RemoteServer` 注册分片代理路由（design.md D1、D2、D5、D6）：
+- [x] 2.2 在 `RemoteServer` 注册分片代理路由（design.md D1、D2、D5、D6）：
   - GET 分支的第一条语句匹配 `HlsPrecache.SEGMENT_PATH`，交给 `serveSegment`
   - 静态方法 `isLoopback(String)`
   - 包内可覆盖的测试接缝 `openSegment(String, String)`，默认实现是 `SegmentProxyResponse.from(HlsPrecache.get().openSegment(...))`
