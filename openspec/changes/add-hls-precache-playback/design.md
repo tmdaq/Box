@@ -154,18 +154,22 @@ private void playUrl(String url, HashMap<String, String> headers, boolean precac
     //   第一层 onSuccess：
     //     if (!M3u8PlayPlanner.isPlaylist(content)) { startPlayUrl(url, headers); return; }
     //     String forwardurl = M3u8PlayPlanner.findForwardUrl(url, content);       // 替换 :714-742
-    //     if ("".equals(forwardurl)) { playPlan(plan(url, finalUrl(response.getRawResponse(), url), content, ...), headers); return; }
+    //     if ("".equals(forwardurl)) { playM3u8(url, finalUrl(response.getRawResponse(), url), content, ...); return; }
     //   第二层 onSuccess：
-    //     playPlan(plan(finalforwardurl, finalUrl(response.getRawResponse(), finalforwardurl), content, ...), headers);   // 替换 :763-770
+    //     playM3u8(finalforwardurl, finalUrl(response.getRawResponse(), finalforwardurl), content, ...);   // 替换 :763-770
 }
 
-private M3u8PlayPlanner.Plan plan(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
-                                  boolean purify, boolean precache) {
-    return M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
+private void cancelM3u8Fetch() {          // playUrl 开头和离开播放页时（D6）各调一次
+    OkGo.getInstance().cancelTag("m3u8-1");
+    OkGo.getInstance().cancelTag("m3u8-2");
+}
+
+/** 离开播放页之后才到达的回调直接丢弃，不调用 rewrite（见 D6）。 */
+private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
+                      boolean purify, boolean precache) {
+    if (!isAdded()) return;               // PlayActivity：if (isFinishing() || isDestroyed()) return;
+    M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
             RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
-}
-
-private void playPlan(M3u8PlayPlanner.Plan p, HashMap<String, String> headers) {
     if (p.setM3u8Content) RemoteServer.m3u8Content = p.m3u8Content;
     startPlayUrl(p.playUrl, headers, p.precached);
 }
@@ -249,6 +253,11 @@ private void startPlayUrl(String url, HashMap<String, String> headers, boolean k
 | `PlayFragment.onDestroyView` | 在 `mVideoView.release()` 之后加 `HlsPrecache.get().endSession()` | 离开详情页（返回、被系统回收） |
 | `PlayActivity.onDestroy` | 在 `mVideoView.release()` 之后加同样一行 | 离开全屏播放页 |
 | `PlayActivity.onPictureInPictureModeChanged` 的 `else` 分支 | 在 `if (onStopCalled) { mVideoView.release(); }` 里，release 之后加同样一行 | 用户关掉画中画小窗，播放器已经释放；Activity 不一定马上销毁，不在这里结束的话，会话会一直留到 Activity 销毁 |
+
+**晚到的 m3u8 回调**：OkGo 回调在主线程派发，离开播放页时可能已经在队列里。只结束会话不够，回调之后还会 `rewrite` 出一个没人用的新会话。所以两处都要做：
+
+- `PlayFragment.onDestroyView`、`PlayActivity.onDestroy` 在 `endSession` 之前调 `cancelM3u8Fetch()`，取消还在进行的 `m3u8-1` / `m3u8-2` 请求；
+- `playM3u8` 在调用 `plan()` 之前检查页面还在不在（PlayFragment 用 `isAdded()`，PlayActivity 用 `isFinishing() || isDestroyed()`），不在就直接返回，不调用 `rewrite`。拉取失败、内容不是 m3u8 的回退走 `startPlayUrl`，它本来就只结束会话、不建会话，页面不在时由它自己的检查返回（PlayFragment 是 `isAdded()`，PlayActivity 是 `mVideoView == null`）。
 
 不加的地方：`onPause`、`onStop`、`onHiddenChanged`、进入画中画、DetailActivity 的小窗与全屏切换、后台播放服务。这些都只是暂停或继续播放，不算离开。DetailActivity 关闭画中画时只暂停不释放（:1215），所以也不结束。
 
@@ -378,6 +387,7 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
    - 按「下一集」：几秒内旧的 `s<id>` 目录被删除，出现新的会话目录。
    - 在同一集上按「重播」：会话目录名不变（复用），已下载的 `.seg` 文件仍在。
    - 返回退出播放页：目录在几秒内被清空。杀进程后重启 App：`hlscache/` 不存在或为空。
+   - **晚到的 m3u8 回调**：用第 7 项的限速环境（或代理工具给 m3u8 请求加 5 秒延迟），从详情页进入全屏播放页后、画面出来之前立刻按返回；对详情页小窗也做一次（进入详情页后立刻返回）。等 10 秒后看目录：不出现新的会话目录；`adb logcat | grep -i okgo` 里能看到 m3u8 请求被取消，或者回调到达后没有任何播放动作。
 7. **限速环境下对比卡顿**：用路由器限速或电脑热点加 Network Link Conditioner，把带宽限到略高于片源码率（比如码率的 1.2 倍）。
    - 预缓存关闭时播放 10 分钟，记录卡顿（出现缓冲转圈）的次数和总时长。
    - 预缓存开启时播放同一片源同一段 10 分钟，记录同样的数据。

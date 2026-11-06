@@ -696,8 +696,7 @@ public class PlayFragment extends BaseLazyFragment {
             startPlayUrl(url, headers);
             return;
         }
-        OkGo.getInstance().cancelTag("m3u8-1");
-        OkGo.getInstance().cancelTag("m3u8-2");
+        cancelM3u8Fetch();
         //remove ads in m3u8
         HttpHeaders hheaders = new HttpHeaders();
         if (headers != null) {
@@ -721,8 +720,8 @@ public class PlayFragment extends BaseLazyFragment {
 
                         String forwardurl = M3u8PlayPlanner.findForwardUrl(url, content);
                         if ("".equals(forwardurl)) {
-                            playPlan(plan(url, M3u8PlayPlanner.finalUrl(response.getRawResponse(), url), content,
-                                    headers, purify, precache), headers);
+                            playM3u8(url, M3u8PlayPlanner.finalUrl(response.getRawResponse(), url), content,
+                                    headers, purify, precache);
                             return;
                         }
                         final String finalforwardurl = forwardurl;
@@ -733,8 +732,8 @@ public class PlayFragment extends BaseLazyFragment {
                                     @Override
                                     public void onSuccess(Response<String> response) {
                                         String content = response.body();
-                                        playPlan(plan(finalforwardurl, M3u8PlayPlanner.finalUrl(response.getRawResponse(), finalforwardurl),
-                                                content, headers, purify, precache), headers);
+                                        playM3u8(finalforwardurl, M3u8PlayPlanner.finalUrl(response.getRawResponse(), finalforwardurl),
+                                                content, headers, purify, precache);
                                     }
 
                                     @Override
@@ -763,13 +762,17 @@ public class PlayFragment extends BaseLazyFragment {
                 });
     }
 
-    private M3u8PlayPlanner.Plan plan(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
-                                      boolean purify, boolean precache) {
-        return M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
-                RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
+    private void cancelM3u8Fetch() {
+        OkGo.getInstance().cancelTag("m3u8-1");
+        OkGo.getInstance().cancelTag("m3u8-2");
     }
 
-    private void playPlan(M3u8PlayPlanner.Plan p, HashMap<String, String> headers) {
+    /** 拿到 m3u8 之后决定交给播放器什么并开始播放。离开详情页之后（Fragment 已经 detach）才到达的回调直接丢弃，不调用 rewrite，不留下没人用的预缓存会话。 */
+    private void playM3u8(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
+                          boolean purify, boolean precache) {
+        if (!isAdded()) return;
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
+                RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
         if (p.setM3u8Content) RemoteServer.m3u8Content = p.m3u8Content;
         startPlayUrl(p.playUrl, headers, p.precached);
     }
@@ -1158,6 +1161,7 @@ public class PlayFragment extends BaseLazyFragment {
             mVideoView.release();
             mVideoView = null;
         }
+        cancelM3u8Fetch();
         HlsPrecache.get().endSession();
         stopLoadWebView(true);
         stopParse();
