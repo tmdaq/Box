@@ -77,12 +77,16 @@ public final class M3u8PlayPlanner {
 
     /**
      * 拿到最终要播的那份 m3u8 后，决定交给播放器什么。不做 IO（purifier / rewriter 由调用方注入）。
-     * @param playlistUrl 这份 m3u8 的真实地址：没跟随时是 url，跟随过时是 finalforwardurl
+     * @param playlistUrl 请求这份 m3u8 时的地址：没跟随时是 url，跟随过时是 finalforwardurl
+     * @param finalUrl    跟随重定向之后的最终地址，只交给 rewriter（见下文「重定向」）
      * @param port        RemoteServer.serverPort
      */
-    public static Plan plan(String playlistUrl, String content, Map<String, String> headers,
+    public static Plan plan(String playlistUrl, String finalUrl, String content, Map<String, String> headers,
                             boolean purify, boolean precache, int port,
                             Purifier purifier, Rewriter rewriter);
+
+    /** raw != null ? raw.request().url().toString() : requestedUrl。raw 是 OkGo 回调里的 response.getRawResponse()。 */
+    public static String finalUrl(okhttp3.Response raw, String requestedUrl);
 
     public static final class Plan {
         /** 交给 startPlayUrl 的地址。 */
@@ -102,12 +106,16 @@ public final class M3u8PlayPlanner {
 ```
 purified = purify ? purifier.purify(base, content) : null
 if (precache):
-    rewritten = rewriter.rewrite(playlistUrl, purified != null ? purified : content, headers, port)
+    rewritten = rewriter.rewrite(finalUrl, purified != null ? purified : content, headers, port)
     if (rewritten != null) return Plan(local, set=true, rewritten, precached=true)
 if (purify) return Plan(purified != null ? local : playlistUrl, set=true, purified, precached=false)   // 现状
 return Plan(playlistUrl, set=false, null, precached=false)
 ```
 
+- **重定向**：OkGo 的全局 client 会跟随重定向。m3u8 被 302 到另一个路径、列表里又是相对分片时，必须按重定向之后的地址解析，否则分片地址是错的。所以 `plan` 区分两个地址：
+  - `playlistUrl`（请求时的地址）用来算去广告的目录前缀 `base`，也是不改写时交给播放器的地址。这两处和改动前逐字一致，预缓存关闭时行为不变；播放器拿到原地址后会自己跟随重定向。
+  - `finalUrl`（`M3u8PlayPlanner.finalUrl(response.getRawResponse(), 请求地址)`，OkGo 3.0.4 的 `Response.getRawResponse()` 是 OkHttp 的最终响应，`request()` 是重定向之后的最后一次请求）只交给 `rewriter`。S1 用它解析相对分片地址，也用它判断会话复用：重播、切内核重试时比较的是两次的最终地址。没有重定向时两者相同（`HttpUrl.toString()` 会做规范化，比如百分号编码，两次结果一致，不影响复用判断）。
+  - 两层拉取各取各的：第一层用 `finalUrl(第一层响应, url)`，第二层用 `finalUrl(第二层响应, finalforwardurl)`。子列表地址本身仍按请求地址 `url` 拼出（`findForwardUrl` 逐字不变），第一层重定向后再跟随相对子列表的既有问题不在本 change 处理。
 - `precache == false` 时 `rewriter` 一次都不调用；`purify == false` 时 `purifier` 一次都不调用。
 - `headers` 原样传给 `rewriter`（可能为 null），不复制，S1 会自己复制。
 - 不捕获 `purifier` 的异常，和现状一致（现在异常也是从 `onSuccess` 里抛出去）。`rewriter` 按 S1 的约定不抛异常。
@@ -146,14 +154,14 @@ private void playUrl(String url, HashMap<String, String> headers, boolean precac
     //   第一层 onSuccess：
     //     if (!M3u8PlayPlanner.isPlaylist(content)) { startPlayUrl(url, headers); return; }
     //     String forwardurl = M3u8PlayPlanner.findForwardUrl(url, content);       // 替换 :714-742
-    //     if ("".equals(forwardurl)) { playPlan(plan(url, content, ...), headers); return; }
+    //     if ("".equals(forwardurl)) { playPlan(plan(url, finalUrl(response.getRawResponse(), url), content, ...), headers); return; }
     //   第二层 onSuccess：
-    //     playPlan(plan(finalforwardurl, content, ...), headers);                 // 替换 :763-770
+    //     playPlan(plan(finalforwardurl, finalUrl(response.getRawResponse(), finalforwardurl), content, ...), headers);   // 替换 :763-770
 }
 
-private M3u8PlayPlanner.Plan plan(String playlistUrl, String content, HashMap<String, String> headers,
+private M3u8PlayPlanner.Plan plan(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
                                   boolean purify, boolean precache) {
-    return M3u8PlayPlanner.plan(playlistUrl, content, headers, purify, precache,
+    return M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
             RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
 }
 
@@ -227,8 +235,8 @@ private void startPlayUrl(String url, HashMap<String, String> headers, boolean k
 | 路径 | 经过 | 结果 |
 | --- | --- | --- |
 | `playNext` / `playPrevious` → `play(false)` | 解析 / 嗅探 / 播放结果 → `playUrl` | 适用时 `rewrite`（地址不同，S1 清空旧会话）；不适用时 `startPlayUrl` 结束会话 |
-| 控制栏 `replay` → `play(replay)` | 同上 | 同一地址 → S1 复用 |
-| `autoRetry` → `switchPlayer()` + `play(false)` | 同上 | 同一地址 → S1 复用；从外部播放器切到 IJK 后开始预缓存 |
+| 控制栏 `replay` → `play(replay)` | 同上 | 最终地址（重定向之后）相同 → S1 复用 |
+| `autoRetry` → `switchPlayer()` + `play(false)` | 同上 | 最终地址相同 → S1 复用；从外部播放器切到 IJK 后开始预缓存 |
 | `autoRetryFromLoadFoundVideoUrls` | 直接 `playUrl` | 同上 |
 | 荐片、迅雷、存储空间 | `playUrl(..., false)` | `startPlayUrl` 结束会话 |
 | yxdm 及其上下段 | 直接 `startPlayUrl` | 结束会话 |
@@ -325,7 +333,7 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
 
 | 测试 | 类型 | 覆盖 |
 | --- | --- | --- |
-| `util/M3u8PlayPlannerTest` | 纯 JUnit | 第 1 步（characterization）：`shouldFetch` 在 `precache=false` 时的真值表（去广告开 / 关 × 地址含 `.m3u8` / 含 `://127.0.0.1/` / 都不含 / 带端口的 `127.0.0.1:9978/...`）；`isPlaylist`；`findForwardUrl` 的媒体列表、单个绝对 / 根相对 / 相对子列表、`.m3u8?` 带参数、`\r\n` 换行、唯一的非空行不是 m3u8；`plan` 在 `precache=false` 时 purify 成功 / 返回 null 两种结果，以及传给 purifier 的目录前缀。第 2 步（TDD）：`precache=true` 下净化结果 / 原文分别交给 rewriter、rewriter 返回非 null 和 null 的各种组合、`precache=false` 时 rewriter 不被调用、`purify=false` 时 purifier 不被调用、headers 原样传递、port 拼进本地地址 |
+| `util/M3u8PlayPlannerTest` | 纯 JUnit | 第 1 步（characterization）：`shouldFetch` 在 `precache=false` 时的真值表（去广告开 / 关 × 地址含 `.m3u8` / 含 `://127.0.0.1/` / 都不含 / 带端口的 `127.0.0.1:9978/...`）；`isPlaylist`；`findForwardUrl` 的媒体列表、单个绝对 / 根相对 / 相对子列表、`.m3u8?` 带参数、`\r\n` 换行、唯一的非空行不是 m3u8；`plan` 在 `precache=false` 时 purify 成功 / 返回 null 两种结果，以及传给 purifier 的目录前缀。第 2 步（TDD）：`precache=true` 下净化结果 / 原文分别交给 rewriter、rewriter 返回非 null 和 null 的各种组合、`precache=false` 时 rewriter 不被调用、`purify=false` 时 purifier 不被调用、headers 原样传递、port 拼进本地地址；重定向（第 1 轮返工）：最终地址只交给 rewriter，目录前缀和不改写时的地址仍用请求地址，预缓存关闭时最终地址不起作用，`finalUrl` 取最后一次请求的地址、没有原始响应时退回请求地址 |
 | `util/FileUtilsCleanPlayerCacheTest` | 纯 JUnit + `TemporaryFolder` | `cleanPlayerCache(String, String)` 删除 `thunder`、`ijkcaches`、`jpali/Downloads`、`hlscache`（含子目录和文件），保留 `jpali` 下的其他内容和外部缓存目录里的其他文件；目录不存在时不报错 |
 | 两个入口、设置页、`App` | 手动 | 见下面「手动验证」 |
 

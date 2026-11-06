@@ -721,7 +721,8 @@ public class PlayFragment extends BaseLazyFragment {
 
                         String forwardurl = M3u8PlayPlanner.findForwardUrl(url, content);
                         if ("".equals(forwardurl)) {
-                            playPlan(plan(url, content, headers, purify, precache), headers);
+                            playPlan(plan(url, M3u8PlayPlanner.finalUrl(response.getRawResponse(), url), content,
+                                    headers, purify, precache), headers);
                             return;
                         }
                         final String finalforwardurl = forwardurl;
@@ -732,7 +733,8 @@ public class PlayFragment extends BaseLazyFragment {
                                     @Override
                                     public void onSuccess(Response<String> response) {
                                         String content = response.body();
-                                        playPlan(plan(finalforwardurl, content, headers, purify, precache), headers);
+                                        playPlan(plan(finalforwardurl, M3u8PlayPlanner.finalUrl(response.getRawResponse(), finalforwardurl),
+                                                content, headers, purify, precache), headers);
                                     }
 
                                     @Override
@@ -761,9 +763,9 @@ public class PlayFragment extends BaseLazyFragment {
                 });
     }
 
-    private M3u8PlayPlanner.Plan plan(String playlistUrl, String content, HashMap<String, String> headers,
+    private M3u8PlayPlanner.Plan plan(String playlistUrl, String finalUrl, String content, HashMap<String, String> headers,
                                       boolean purify, boolean precache) {
-        return M3u8PlayPlanner.plan(playlistUrl, content, headers, purify, precache,
+        return M3u8PlayPlanner.plan(playlistUrl, finalUrl, content, headers, purify, precache,
                 RemoteServer.serverPort, M3U8::purify, HlsPrecache.get()::rewrite);
     }
 
