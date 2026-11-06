@@ -279,6 +279,44 @@ public class SegmentDownloadTest {
     }
 
     @Test
+    public void writeFailureIsDiskError() throws Exception {
+        origin.on(URL).body(new byte[1000]);
+        File tempIsADirectory = new File(tmp.getRoot(), "temp-dir");
+        // 临时文件是个目录：打开写入流就失败
+        store = new SegmentStore(dir, "u") {
+            @Override
+            File newTempFile(String key) {
+                assertTrue(tempIsADirectory.mkdirs());
+                return tempIsADirectory;
+            }
+        };
+        SegmentDownload d = start();
+        awaitFinished();
+
+        assertEquals(SegmentDownload.State.DISK_ERROR, d.awaitHeaders());
+        assertFalse(d.isThrottleSignal());
+        assertFalse(store.isCommitted(segment.key));
+    }
+
+    @Test
+    public void commitFailureIsDiskErrorAndLeavesNoFiles() throws Exception {
+        origin.on(URL).body(new byte[1000]);
+        store = new SegmentStore(dir, "u") {
+            @Override
+            void commit(String key, File temp, long size, String contentType) throws IOException {
+                throw new IOException("rename failed");
+            }
+        };
+        SegmentDownload d = start();
+        awaitFinished();
+
+        assertEquals(SegmentDownload.State.DISK_ERROR, d.awaitHeaders());
+        assertFalse(d.isThrottleSignal());
+        assertFalse(store.isCommitted(segment.key));
+        assertEquals("temp file is deleted", 0, filesInDir().length);
+    }
+
+    @Test
     public void cancelArrivingRightAfterTheCommitDoesNotUndoIt() throws Exception {
         byte[] source = FakeSegmentDownloader.bytesFor(URL, 1000);
         origin.on(URL).body(source);

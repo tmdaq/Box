@@ -346,6 +346,57 @@ public class PrecacheSessionTest {
         assertTrue(store.committedKeys().isEmpty());
     }
 
+    @Test
+    public void writeFailureOfAPrefetchDegradesToPureForwarding() throws Exception {
+        store = failingStore(key(1), false);
+        assertDegradesAfterPrefetchOfSegment1Fails();
+    }
+
+    @Test
+    public void commitFailureOfAPrefetchDegradesToPureForwarding() throws Exception {
+        store = failingStore(key(1), true);
+        assertDegradesAfterPrefetchOfSegment1Fails();
+    }
+
+    /**
+     * 只有 failingKey 的分片写盘失败：临时文件是个目录，打开写入流就失败；或者 rename 提交失败。
+     * 其余分片正常读写。
+     */
+    private SegmentStore failingStore(String failingKey, boolean failCommit) {
+        return new SegmentStore(new File(tmp.getRoot(), "s1"), BASE + "index.m3u8") {
+            @Override
+            File newTempFile(String key) throws IOException {
+                if (failCommit || !key.equals(failingKey)) return super.newTempFile(key);
+                File dir = new File(tmp.getRoot(), "temp-is-a-directory");
+                assertTrue(dir.mkdirs() || dir.isDirectory());
+                return dir;
+            }
+
+            @Override
+            void commit(String key, File temp, long size, String contentType) throws IOException {
+                if (failCommit && key.equals(failingKey)) throw new IOException("rename failed");
+                super.commit(key, temp, size, contentType);
+            }
+        };
+    }
+
+    private void assertDegradesAfterPrefetchOfSegment1Fails() throws Exception {
+        newSession(20);
+        assertArrayEquals(bytes(0), play(0));
+        awaitIdle();
+        assertEquals("prefetch of seg1 was attempted", 1, origin.requestCount(url(1)));
+        int before = submitted.get();
+        int requestsBefore = origin.requestCount(url(5));
+
+        assertArrayEquals(bytes(5), play(5));
+        assertArrayEquals(bytes(0), play(0));
+
+        assertEquals("no download is scheduled after degrading", before, submitted.get());
+        assertEquals("forwarded to origin", requestsBefore + 1, origin.requestCount(url(5)));
+        assertEquals("committed segments are not read any more", 2, origin.requestCount(url(0)));
+        assertFalse(store.isCommitted(key(5)));
+    }
+
     private int statusAfterPlan(int index, int code) {
         origin.on(url(index)).code(code);
         return session.open(index).status;
