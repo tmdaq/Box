@@ -3,6 +3,8 @@ package com.github.tvbox.osc.util;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import com.github.tvbox.osc.precache.HlsPrecache;
+
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -63,6 +65,16 @@ public class FileUtilsCleanPlayerCacheTest {
 
         assertFalse(new File(externalCacheDir, "jpali/Downloads").exists());
         assertTrue(keep.exists());
+    }
+
+    @Test
+    public void deletesHlsPrecacheDirUnderExternalCacheDir() throws IOException {
+        newFile(externalCacheDir, HlsPrecache.CACHE_DIR_NAME + "/s1/a.seg");
+        newFile(externalCacheDir, HlsPrecache.CACHE_DIR_NAME + "/b.tmp");
+
+        clean();
+
+        assertFalse(new File(externalCacheDir, HlsPrecache.CACHE_DIR_NAME).exists());
     }
 
     @Test
