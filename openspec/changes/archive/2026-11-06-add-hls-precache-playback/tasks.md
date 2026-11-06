@@ -58,3 +58,5 @@
   - depends-on: 1.1, 1.2, 2.1, 3.1, 4.1, 4.2
   - verify: `GRADLE_TASK=:app:assembleArm64GenericNormalDebug scripts/gradle-test.sh`，以及 `scripts/gradle-test.sh`（全量单测）。本 change 不涉及 `pyramid/` 和 python flavor，extra-verify 为「无」
   - manual-verify: 在 S1、S2、S3 合并后的集成分支上，按 design.md「手动验证」1–9 项逐项执行（第 9 项依赖 S2 的分片代理端点），每项记录通过与否和观察到的数据（第 7 项附两组卡顿次数和时长），结果附在交付说明里
+  - 结果（dev-test，集成分支 `1-integration` @ d42a54f）：`assembleArm64GenericNormalDebug` BUILD SUCCESSFUL；全量单测 16 个类 191 个用例 0 失败（连续 4 次）。
+  - 手动验证：**未执行**。用户决定暂缓真机验证，先合并交付；清单见 #1，待后续补验。

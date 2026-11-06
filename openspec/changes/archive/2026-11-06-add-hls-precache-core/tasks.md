@@ -58,8 +58,9 @@
 
 ## 2. 验证
 
-- [ ] 2.1 验证：构建 + 测试通过
+- [x] 2.1 验证：构建 + 测试通过
   - writes: 无
   - reads: docs/agents/dev-workflow.md
   - depends-on: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6
   - verify: `GRADLE_TASK=:app:assembleArm64GenericNormalDebug scripts/gradle-test.sh`，以及 `scripts/gradle-test.sh`（全量单测）。本 change 不涉及 UI，没有手动验证项；真机上的手动验证由 S3（#4）负责
+  - 结果（dev-test，集成分支 `1-integration` @ d42a54f）：`assembleArm64GenericNormalDebug` BUILD SUCCESSFUL；全量单测 16 个类 191 个用例 0 失败（连续 4 次）。

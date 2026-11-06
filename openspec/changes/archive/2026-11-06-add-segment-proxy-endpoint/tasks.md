@@ -81,3 +81,5 @@
        3. 取其中一行，把端口换成 19978，执行 `curl -s -D - -o /dev/null -H "Accept-Encoding: gzip" "<地址>"`，应该返回 200，并且没有 `Content-Encoding` 头。
        4. 执行 `adb shell ls -la /sdcard/Android/data/com.github.tvbox.osc.tk/cache/hlscache/`，应该能看到 `s<id>/` 目录，里面的 `.seg` 文件在增加。
        5. 视频正常播放，拖动进度后也能继续播放。
+  - 结果（dev-test，集成分支 `1-integration` @ d42a54f）：`assembleArm64GenericNormalDebug` BUILD SUCCESSFUL；全量单测 16 个类 191 个用例 0 失败（连续 4 次）。
+  - 手动验证：**未执行**。用户决定暂缓真机验证，先合并交付；清单见 #1，待后续补验。
