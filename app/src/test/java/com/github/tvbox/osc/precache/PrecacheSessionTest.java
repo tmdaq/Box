@@ -351,10 +351,16 @@ public class PrecacheSessionTest {
     }
 
     @Test
-    public void noPrefetchBeforeFirstRequest() {
+    public void prefetchStartsOnlyAfterTheFirstRequest() throws Exception {
         newSession(40);
 
-        assertEquals(0, submitted.get());
+        assertEquals("no prefetch before the first request", 0, submitted.get());
+        assertEquals(0, origin.totalRequests());
+
+        play(5);
+        // 对照：请求过第一个分片之后，从它的下一个分片开始预取
+        eventually("prefetch after the first request", () -> origin.requestCount(url(6)) == 1);
+        assertEquals("prefetch does not start from segment 0", 0, origin.requestCount(url(0)));
     }
 
     @Test
