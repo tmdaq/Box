@@ -137,7 +137,10 @@ final class SegmentDownload implements Runnable {
         return commit(file);
     }
 
-    /** 提交和改为 COMPLETED 在同一个锁里完成；已取消的下载一定不会提交。 */
+    /**
+     * 提交和改为 COMPLETED 在同一个锁里完成：读者和 cancel() 要么看到还没提交的 STREAMING，
+     * 要么看到已经提交的 COMPLETED。已取消的下载一定不会提交。
+     */
     private synchronized State commit(File file) {
         if (state == State.CANCELLED) return State.CANCELLED;
         if (contentLength >= 0 && bytesWritten != contentLength) return State.FAILED;
@@ -147,12 +150,14 @@ final class SegmentDownload implements Runnable {
             return State.DISK_ERROR;
         }
         temp = null;
+        state = State.COMPLETED;
+        notifyAll();
         return State.COMPLETED;
     }
 
-    /** 进入终态；已经被取消的保持 CANCELLED。 */
+    /** 进入终态；已经是终态的（被取消，或者已提交）保持不变。 */
     private synchronized void finish(State terminal, boolean throttle) {
-        if (state == State.CANCELLED) return;
+        if (isFinished()) return;
         state = terminal;
         throttleSignal = throttle;
         notifyAll();

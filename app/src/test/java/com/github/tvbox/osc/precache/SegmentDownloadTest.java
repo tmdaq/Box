@@ -24,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class SegmentDownloadTest {
 
@@ -275,6 +276,30 @@ public class SegmentDownloadTest {
 
         assertEquals(SegmentDownload.State.DISK_ERROR, d.awaitHeaders());
         assertFalse(d.isThrottleSignal());
+    }
+
+    @Test
+    public void cancelArrivingRightAfterTheCommitDoesNotUndoIt() throws Exception {
+        byte[] source = FakeSegmentDownloader.bytesFor(URL, 1000);
+        origin.on(URL).body(source);
+        AtomicReference<SegmentDownload> download = new AtomicReference<>();
+        // 提交（rename）一完成就到达的取消，比如跳转或会话结束
+        store = new SegmentStore(dir, "u") {
+            @Override
+            void commit(String key, File temp, long size, String contentType) throws IOException {
+                super.commit(key, temp, size, contentType);
+                download.get().cancel();
+            }
+        };
+        SegmentDownload d = newDownload(true);
+        download.set(d);
+
+        d.run();
+
+        assertTrue(store.isCommitted(segment.key));
+        assertEquals("a committed download is COMPLETED", SegmentDownload.State.COMPLETED, d.awaitHeaders());
+        assertArrayEquals(source, readAll(d.openReader()));
+        assertEquals(1, finishedCalls.get());
     }
 
     @Test

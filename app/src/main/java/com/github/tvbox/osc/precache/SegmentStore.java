@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 一个会话目录里已提交的分片（design.md D6）。只有已提交的分片记在内存里；
  * 文件名是 {@code <key>.seg}，下载中的临时文件是 {@code <key>.<下载序号>.tmp}。
  */
-final class SegmentStore {
+class SegmentStore {
     /** 进程内递增，保证两次下载不会写同一个临时文件。 */
     private static final AtomicLong TEMP_SEQUENCE = new AtomicLong();
 
