@@ -3,11 +3,13 @@ package com.github.tvbox.osc.util;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import org.junit.Test;
 
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -178,6 +180,111 @@ public class M3u8PlayPlannerTest {
         assertFalse(p.precached);
     }
 
+    // ---------- shouldFetch（precache=true） ----------
+
+    @Test
+    public void shouldFetchIsTrueWhenOnlyPrecacheOnAndUrlLooksLikeM3u8() {
+        assertTrue(M3u8PlayPlanner.shouldFetch(URL, false, true));
+        assertTrue(M3u8PlayPlanner.shouldFetch("http://127.0.0.1/proxy?do=py", false, true));
+    }
+
+    @Test
+    public void shouldFetchIsFalseWhenOnlyPrecacheOnAndUrlIsPlainDirectLink() {
+        assertFalse(M3u8PlayPlanner.shouldFetch("https://cdn.a.com/v.mp4", false, true));
+        assertFalse(M3u8PlayPlanner.shouldFetch("http://127.0.0.1:9978/proxy?do=py", false, true));
+    }
+
+    // ---------- plan（precache=true） ----------
+
+    @Test
+    public void planRewritesPurifiedContentAndPlaysLocalM3u8() {
+        RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
+
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+                fixedPurifier("PURIFIED"), rewriter);
+
+        assertEquals("PURIFIED", rewriter.content);
+        assertEquals(LOCAL, p.playUrl);
+        assertTrue(p.setM3u8Content);
+        assertEquals("REWRITTEN", p.m3u8Content);
+        assertTrue(p.precached);
+    }
+
+    @Test
+    public void planRewritesOriginalContentWhenPurifyFails() {
+        RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
+
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+                fixedPurifier(null), rewriter);
+
+        assertEquals(MEDIA, rewriter.content);
+        assertEquals(LOCAL, p.playUrl);
+        assertEquals("REWRITTEN", p.m3u8Content);
+        assertTrue(p.precached);
+    }
+
+    @Test
+    public void planRewritesOriginalContentWithoutPurifyingWhenPurifyOff() {
+        RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
+
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, false, true, PORT,
+                forbiddenPurifier(), rewriter);
+
+        assertEquals(MEDIA, rewriter.content);
+        assertEquals(LOCAL, p.playUrl);
+        assertTrue(p.setM3u8Content);
+        assertEquals("REWRITTEN", p.m3u8Content);
+        assertTrue(p.precached);
+    }
+
+    @Test
+    public void planPassesPlaylistUrlHeadersAndPortToRewriter() {
+        RecordingRewriter rewriter = new RecordingRewriter("REWRITTEN");
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Referer", "https://site.c.com/");
+
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, headers, false, true, 9981,
+                forbiddenPurifier(), rewriter);
+
+        assertEquals(URL, rewriter.playlistUrl);
+        assertSame(headers, rewriter.headers);
+        assertEquals(9981, rewriter.port);
+        assertEquals("http://127.0.0.1:9981/m3u8", p.playUrl);
+    }
+
+    @Test
+    public void planFallsBackToPurifiedLocalM3u8WhenRewriteNotApplicable() {
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+                fixedPurifier("PURIFIED"), new RecordingRewriter(null));
+
+        assertEquals(LOCAL, p.playUrl);
+        assertTrue(p.setM3u8Content);
+        assertEquals("PURIFIED", p.m3u8Content);
+        assertFalse(p.precached);
+    }
+
+    @Test
+    public void planFallsBackToPlaylistUrlWhenPurifyFailsAndRewriteNotApplicable() {
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, true, true, PORT,
+                fixedPurifier(null), new RecordingRewriter(null));
+
+        assertEquals(URL, p.playUrl);
+        assertTrue(p.setM3u8Content);
+        assertNull(p.m3u8Content);
+        assertFalse(p.precached);
+    }
+
+    @Test
+    public void planFallsBackToPlaylistUrlWhenPurifyOffAndRewriteNotApplicable() {
+        M3u8PlayPlanner.Plan p = M3u8PlayPlanner.plan(URL, MEDIA, null, false, true, PORT,
+                forbiddenPurifier(), new RecordingRewriter(null));
+
+        assertEquals(URL, p.playUrl);
+        assertFalse(p.setM3u8Content);
+        assertNull(p.m3u8Content);
+        assertFalse(p.precached);
+    }
+
     // ---------- 测试替身 ----------
 
     static M3u8PlayPlanner.Purifier fixedPurifier(final String result) {
@@ -202,6 +309,27 @@ public class M3u8PlayPlannerTest {
                 return null;
             }
         };
+    }
+
+    static final class RecordingRewriter implements M3u8PlayPlanner.Rewriter {
+        private final String result;
+        String playlistUrl;
+        String content;
+        Map<String, String> headers;
+        int port;
+
+        RecordingRewriter(String result) {
+            this.result = result;
+        }
+
+        @Override
+        public String rewrite(String playlistUrl, String content, Map<String, String> headers, int port) {
+            this.playlistUrl = playlistUrl;
+            this.content = content;
+            this.headers = headers;
+            this.port = port;
+            return result;
+        }
     }
 
     static final class RecordingPurifier implements M3u8PlayPlanner.Purifier {
