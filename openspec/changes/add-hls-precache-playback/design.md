@@ -319,21 +319,31 @@ public static final String HLS_PRECACHE = "hls_precache";   // 预缓存，默�
 
 ### D9 `App.java` 与 `FileUtils`
 
-**FileUtils**：为了能测试，把清理逻辑挪进一个接收目录的包内重载，原方法只负责取目录：
+**FileUtils**：为了能测试，把清理逻辑挪进一个包内重载，原方法只负责取目录、时间戳和后台执行器：
 
 ```java
 public static void cleanPlayerCache() {
-    cleanPlayerCache(getCachePath(), getExternalCachePath());
+    cleanPlayerCache(getCachePath(), getExternalCachePath(), System.currentTimeMillis(),
+            task -> new Thread(task, "hlscache-trash").start());
 }
 
-/** 包内可见，供测试传入临时目录。 */
-static void cleanPlayerCache(String cachePath, String externalCachePath) {
-    recursiveDelete(new File(cachePath + File.separator + "thunder"));
+/** 包内可见，供测试传入临时目录、时间戳和执行器（测试里用同步或延后执行的执行器）。 */
+static void cleanPlayerCache(String cachePath, String externalCachePath, long now, Executor background) {
+    recursiveDelete(new File(cachePath + File.separator + "thunder"));          // 这三项保持原样
     recursiveDelete(new File(externalCachePath + File.separator + "ijkcaches"));
     recursiveDelete(new File(externalCachePath + File.separator + "jpali" + File.separator + "Downloads"));
-    recursiveDelete(new File(externalCachePath + File.separator + HlsPrecache.CACHE_DIR_NAME));
+    File ext = new File(externalCachePath);
+    moveHlsCacheAside(ext, now);                       // 调用线程：hlscache -> hlscache.trash-<now>
+    background.execute(() -> deleteHlsTrash(ext));     // 后台：删除所有 hlscache.trash-*
 }
 ```
+
+**`hlscache/` 不在主线程递归删除**：进程被杀之后可能残留好几个会话目录（每个最多 300MB，见 S1 的磁盘上限），在主线程递归删除有 ANR 风险，违反「磁盘 IO 不在主线程」。做法：
+
+1. 主线程只做一次 `renameTo`，把 `hlscache` 改名为 `hlscache.trash-<时间戳>`。同一目录下的 rename 是一次元数据操作，很快而且是原子的，之后 `hlscache` 这个路径不存在，新会话可以马上在里面建目录。
+2. `App.onCreate()` 随后 `setCacheRoot(hlscache)`（见下）。
+3. 后台线程删除外部缓存目录下所有以 `hlscache.trash-` 开头的目录，以前几次启动没删完的（比如删到一半进程又被杀）也一起删掉。后台只碰 `hlscache.trash-*`，不碰 `hlscache`，和新会话没有竞争；它在 `setCacheRoot` 之前还是之后开始都一样。
+4. `hlscache` 存在但 rename 失败（比如同名 trash 目录已经存在且非空）时，退回在主线程同步删除，保证 `setCacheRoot` 之后 `hlscache` 里不会有旧内容和新会话混在一起。这是罕见路径，接受它的耗时。
 
 **App.onCreate()**：紧跟 :101 `FileUtils.cleanPlayerCache();` 之后，按 S1 的约定加
 
@@ -342,8 +352,8 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
 ```
 
 - `setCacheRoot` 只记路径，不做 IO，不管开关是否打开都调用，这样运行中打开开关也能立即生效。
-- 必须在 `cleanPlayerCache()` 之后、同一线程同步执行。如果把删除 `hlscache/` 挪到后台线程，可能会删掉刚开始的新会话的目录。
-- 删除 `hlscache/` 是在主线程做磁盘 IO，和现有的三项清理一样。上一次进程最多留下一个会话目录（至多 300MB，约一两百个文件），删除耗时和现有的 `ijkcaches` 清理同量级。这是沿用现有清理时机的取舍，见 Risks。
+- 必须在 `cleanPlayerCache()` 之后、同一线程执行：rename（或退回的同步删除）完成之后，`hlscache` 才是空的。不能把整个 `hlscache/` 交给后台删，那样可能删掉刚开始的新会话的目录；后台只删改过名的 trash 目录。
+- `App.java` 不需要改：`cleanPlayerCache()` 的签名和调用位置不变。
 - `App` 只把 `File` 交给单例，不把 `Context` 交给它。
 
 ### D10 测试策略
@@ -351,7 +361,7 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
 | 测试 | 类型 | 覆盖 |
 | --- | --- | --- |
 | `util/M3u8PlayPlannerTest` | 纯 JUnit | 第 1 步（characterization）：`shouldFetch` 在 `precache=false` 时的真值表（去广告开 / 关 × 地址含 `.m3u8` / 含 `://127.0.0.1/` / 都不含 / 带端口的 `127.0.0.1:9978/...`）；`isPlaylist`；`findForwardUrl` 的媒体列表、单个绝对 / 根相对 / 相对子列表、`.m3u8?` 带参数、`\r\n` 换行、唯一的非空行不是 m3u8；`plan` 在 `precache=false` 时 purify 成功 / 返回 null 两种结果，以及传给 purifier 的目录前缀。第 2 步（TDD）：`precache=true` 下净化结果 / 原文分别交给 rewriter、rewriter 返回非 null 和 null 的各种组合、`precache=false` 时 rewriter 不被调用、`purify=false` 时 purifier 不被调用、headers 原样传递、port 拼进本地地址；重定向（第 1 轮返工）：最终地址只交给 rewriter，目录前缀和不改写时的地址仍用请求地址，预缓存关闭时最终地址不起作用，`finalUrl` 取最后一次请求的地址、没有原始响应时退回请求地址 |
-| `util/FileUtilsCleanPlayerCacheTest` | 纯 JUnit + `TemporaryFolder` | `cleanPlayerCache(String, String)` 删除 `thunder`、`ijkcaches`、`jpali/Downloads`、`hlscache`（含子目录和文件），保留 `jpali` 下的其他内容和外部缓存目录里的其他文件；目录不存在时不报错 |
+| `util/FileUtilsCleanPlayerCacheTest` | 纯 JUnit + `TemporaryFolder` | `cleanPlayerCache(String, String, long, Executor)` 删除 `thunder`、`ijkcaches`、`jpali/Downloads`、`hlscache`（含子目录和文件），保留 `jpali` 下的其他内容和外部缓存目录里的其他文件；目录不存在时不报错；`hlscache` 在调用线程上被改名、trash 目录在后台删除（用延后执行的执行器区分）、以前残留的 `hlscache.trash-*` 也在后台删除、rename 失败时在调用线程上同步删除 |
 | 两个入口、设置页、`App` | 手动 | 见下面「手动验证」 |
 
 测试替身用匿名类实现 `Purifier` / `Rewriter`，记录收到的参数；「不应被调用」的替身在被调用时直接 `fail()`。
@@ -395,6 +405,7 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
    - 按「下一集」：几秒内旧的 `s<id>` 目录被删除，出现新的会话目录。
    - 在同一集上按「重播」：会话目录名不变（复用），已下载的 `.seg` 文件仍在。
    - 返回退出播放页：目录在几秒内被清空。杀进程后重启 App：`hlscache/` 不存在或为空。
+   - **启动清理不阻塞主线程**：开启预缓存播放 5 分钟以上，再换两部片各播 5 分钟（留下较大的会话目录），播放中 `adb shell am force-stop com.github.tvbox.osc.tk` 杀进程。重启 App：首页正常出现、没有 ANR 弹窗；启动后立刻 `adb shell ls /sdcard/Android/data/com.github.tvbox.osc.tk/cache/` 可能看到 `hlscache.trash-<时间戳>`，几秒后它消失；`hlscache/` 不存在，或者只有新会话的目录。
    - **晚到的 m3u8 回调**：用第 7 项的限速环境（或代理工具给 m3u8 请求加 5 秒延迟），从详情页进入全屏播放页后、画面出来之前立刻按返回；对详情页小窗也做一次（进入详情页后立刻返回）。等 10 秒后看目录：不出现新的会话目录；`adb logcat | grep -i okgo` 里能看到 m3u8 请求被取消，或者回调到达后没有任何播放动作。
 7. **限速环境下对比卡顿**：用路由器限速或电脑热点加 Network Link Conditioner，把带宽限到略高于片源码率（比如码率的 1.2 倍）。
    - 预缓存关闭时播放 10 分钟，记录卡顿（出现缓冲转圈）的次数和总时长。
@@ -417,7 +428,7 @@ HlsPrecache.get().setCacheRoot(new File(FileUtils.getExternalCachePath(), HlsPre
 
 - **[风险] 两个播放页同时存在时争用唯一的会话。** 比如详情页 A 的小窗暂停后又打开了另一个播放页 B：B 开始播放会替换 A 的会话，B 关闭时结束会话。回到 A 继续播放，播放器请求旧会话的分片拿到 410，按「出错自动重试」切内核后重新改写，表现为一次短暂的重新加载。→ 这是 S1「同一时间只有一个会话」的直接后果，场景少见，第一期接受，写入 Non-goals；手动验证第 8 项会观察切换时的表现。
 - **[风险] 开关打开、去广告关闭时，起播多一次 m3u8 请求。** → 和去广告开启时现有的开销相同；失败回退原地址。
-- **[风险] 启动时在主线程删除 `hlscache/`。** → 沿用 `cleanPlayerCache()` 现有的时机和线程。挪到后台会和新会话目录产生竞争（D9）。正常退出时会话目录已经在后台删掉，只有进程被杀时才会留下，最多一个会话（300MB）。
+- **[风险] 启动时清理 `hlscache/` 的耗时。** 进程被杀后可能残留好几个会话目录，主线程递归删除有 ANR 风险。→ 主线程只做一次 rename，删除放到后台线程，而且只删改过名的 `hlscache.trash-*`，不会和新会话竞争（D9）。残留：rename 失败时退回主线程同步删除（罕见）；后台删除没做完进程又被杀时，trash 目录留到下次启动再删；trash 目录在外部缓存目录里，系统清理缓存时也会被删掉。
 - **[取舍] `startPlayUrl` 默认结束会话，只有 `precached` 的播放保留。** 一处兜底覆盖所有不改写的分支，代价是开关关闭时每次播放多一次空操作调用。
 - **[取舍] 特殊链接靠调用点传参排除，而不是按 URL 识别。** 以后新增的特殊链接如果走 `playUrl(url, headers)` 的默认重载，会被当作普通点播；但普通点播的判断本身还要求地址含 `.m3u8` 且内容是带 ENDLIST 的媒体列表，误判的后果最多是这一类链接也被预缓存。
 - **[风险] 旧页面晚到的销毁结束新页面的会话。** 先 finish 旧 DetailActivity 再启动新的（画中画后台设置、推送）时，旧页面的 `onDestroy` 可能晚于新页面的 `rewrite`。→ 会话记在页面自己的 `precacheOwner` 名下，旧页面只能结束自己建的会话（D6「只结束本页的会话」）。代价：B 页面播放不走预缓存的内容时，不会结束 A 页面留下的会话，它要等 A 离开或被下一次 `rewrite` 替换；两个播放页同时存在本来就是第一条风险接受的场景。
